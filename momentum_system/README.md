@@ -1,6 +1,107 @@
-# Cross-Venue Momentum Trading System
+# Cross-Venue Momentum Trading System — Toxic Flow Oracle
 
-A Python 3.11+ asyncio system that monitors Uniswap V3 swap events across three fee-tier pools (30 bps, 5 bps, 1 bps) on Arbitrum, constructs directional momentum signals, and places maker limit orders on Deribit perpetual futures.
+A Python 3.11+ asyncio system that monitors Uniswap V3 events (Swaps, Mints, Burns) across three fee-tier pools (30 bps, 5 bps, 1 bps) on Arbitrum, classifies informed vs. uninformed flow in real-time using a **Flow Toxicity Index**, and places maker limit orders on Deribit perpetual futures — trading only when genuinely toxic flow is detected, with toxicity-adaptive position sizing and regime-aware risk management.
+
+## Strategy Overview
+
+> **New to this project?** Read [strategy.md](strategy.md) first — it explains the economic intuition, signals, and why this strategy works using plain English and real-world analogies. The section below is the condensed technical version.
+
+### The Core Insight
+
+Uniswap V3's fee-tier structure creates a natural **self-selection mechanism** that has no analog in traditional finance. When a trader chooses to swap on the 30 bps pool instead of the 5 bps pool, they are *voluntarily paying 6x the fee*. The only rational explanation is urgency — they have time-sensitive information and prioritize execution speed over cost. This is the fingerprint of informed flow.
+
+The system exploits this by building a real-time classifier that separates informed from uninformed flow across all three fee tiers, and only trades on Deribit when the classifier fires with high confidence.
+
+### How It Works (5-Minute Version)
+
+```
+Uniswap V3 Pools (Arbitrum)          Analysis Pipeline           Deribit (CEX)
+┌─────────────────────┐
+│  30 bps Pool Swaps  │──┐
+│   5 bps Pool Swaps  │──┼──► Flow Toxicity    ──► Is FTI in     ──► Place limit
+│   1 bps Pool Swaps  │──┤    Index (FTI)          top 20%?          order on
+│                     │  │                                            Deribit
+│  Mint/Burn Events   │──┼──► LP Behavior      ──► Do LPs agree?     perpetual
+│  (all 3 pools)      │  │    Monitor
+│                     │  │
+│  1 bps Log Returns  │──┴──► Regime Filter    ──► Not CHAOTIC?
+└─────────────────────┘
+```
+
+1. **Flow Toxicity Index (FTI)** — Every 30 seconds, the system aggregates swap flow across all three fee tiers and computes a toxicity score that combines five orthogonal dimensions:
+   - **Tier-weighted directional flow** — The 30 bps pool is weighted 6x because paying 30 bps to trade is a strong information signal.
+   - **Cross-tier coherence** — Is only the expensive pool active? That's the most toxic (2x boost). All tiers agreeing is normal arb (1x). Tiers disagreeing is noise (0x).
+   - **Price impact asymmetry** — Is someone moving the 30 bps pool price disproportionately per dollar vs. the 5 bps pool?
+   - **OFI concentration** — Per-tier Order Flow Imbalance: `(up - down) / (up + down)`. When the 30 bps pool has OFI of 0.9 but the 1 bps pool has 0.1, informed flow is concentrated in the expensive tier.
+   - **Hawkes-inspired clustering** — Measures burst arrival of 30 bps events (fraction within 5 seconds of each other) and cross-excitation asymmetry (does 30 bps activity predict 5 bps activity, indicating information cascading from the expensive pool outward?).
+
+2. **Regime Filter** — Realized volatility and event intensity from the 1 bps pool (highest frequency) classify the market into three states: QUIET (trade normally), ACTIVE (trade aggressively — best regime for signal quality), and CHAOTIC (sit out entirely — can't distinguish informed flow from panic). This is the key difference between a strategy that works in backtest and one that survives live.
+
+3. **LP Behavior Monitor** — Sophisticated LPs on Uniswap V3 reposition *before* price moves. When LPs pull their asks (remove sell-side liquidity), they expect price to rise. This is on-chain "market maker tell" data. The system uses LP bias as a confirmation filter — only enter when LP behavior agrees with the FTI direction.
+
+4. **Signal Gating** — A trade is only placed when *all three conditions* are met: FTI is in the top 20% of the trailing 24-hour distribution, the regime is not CHAOTIC, and LP bias agrees. Most of the time, the system does nothing.
+
+5. **Toxicity-Adaptive Sizing** — Position size scales with the FTI percentile and regime: `size = FTI_percentile × regime_multiplier × max_contracts`. In the ACTIVE regime the multiplier is 1.5x; in QUIET it's 1.0x. This concentrates capital on the highest-conviction signals.
+
+### Why It Can Work
+
+- **Structural information advantage** — The fee-tier self-selection exists in the Uniswap V3 protocol design. It can't be arbitraged away.
+- **Cross-tier analysis is underexplored** — Most quant firms monitoring DEX data watch only the highest-volume pool. Comparing flow across all three tiers is a differentiated signal.
+- **The regime filter protects capital** — The #1 killer of cross-venue strategies is volatility events. Explicit regime detection addresses this.
+- **LP behavior is genuinely leading** — Sophisticated on-chain market makers reposition before price moves, creating data that has no equivalent in traditional markets.
+- **Aggressive filtering** — Trading only the top 20% of signals sacrifices frequency for quality. At 5–30 minute holding periods, expect 5–15 trades per day with higher win rates.
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        EventListener                             │
+│  Subscribes to Swap + Mint/Burn events on all 3 pool contracts  │
+└───────────┬───────────────────────────────────┬──────────────────┘
+            │ SwapEvent                         │ LiquidityEvent
+            ▼                                   ▼
+┌───────────────────┐  ┌──────────────┐  ┌──────────────┐
+│  RegimeFilter     │  │ FlowToxicity │  │  LPMonitor   │
+│  (realized vol,   │  │   Engine     │  │  (Mint/Burn  │
+│   intensity,      │◄─┤  (FTI per    │─►│   bias)      │
+│   QUIET/ACTIVE/   │  │   30s bucket)│  └──────────────┘
+│   CHAOTIC)        │  └──────┬───────┘
+└───────────────────┘         │ ToxicitySignal
+                              ▼
+                  ┌───────────────────────┐
+                  │  ExecutionManager     │
+                  │  (toxicity-adaptive   │
+                  │   sizing, limit       │
+                  │   order placement)    │
+                  └───────────┬───────────┘
+                              │
+                  ┌───────────▼───────────┐
+                  │  RiskManager          │
+                  │  (regime-aware stops, │
+                  │   margin, cooldown)   │
+                  └───────────────────────┘
+```
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `flow_toxicity.py` | Core intelligence — FTI computation per time bucket, cross-tier coherence, impact asymmetry, OFI concentration, Hawkes clustering, percentile gating, signal emission |
+| `regime_filter.py` | Rolling realized vol from 1 bps returns, event intensity, regime classification (QUIET/ACTIVE/CHAOTIC) |
+| `lp_monitor.py` | Mint/Burn event processing, LP bias calculation (net liquidity above vs. below current tick) |
+| `event_listener.py` | Arbitrum RPC subscription for Swap + Mint/Burn events, log parsing, reconnection |
+| `execution_manager.py` | Order lifecycle — toxicity-adaptive sizing, limit price computation, stale order cancellation |
+| `risk_manager.py` | Pre-trade checks, regime-aware stop-loss widening, take-profit, max holding time enforcement |
+| `signal_engine.py` | Legacy momentum signal engine (conviction + momentum). Still available for comparison backtests |
+| `backtest.py` | Replay historical data through either the toxicity engine or the legacy signal engine |
+| `database.py` | Async SQLite persistence for swap events, liquidity events, flow buckets, signals, orders, trades |
+| `config.py` | Pydantic configuration models with validation |
+| `models.py` | Data models — SwapEvent, LiquidityEvent, FlowBucket, ToxicitySignal, Regime, etc. |
+| `main.py` | Entry point — wires all components, manages lifecycle |
+
+---
 
 ## Prerequisites
 
@@ -52,12 +153,13 @@ python main.py
 ```
 
 What happens:
-- Connects to Arbitrum RPC and subscribes to Swap events on all configured pools.
+- Connects to Arbitrum RPC and subscribes to Swap + Mint/Burn events on all configured pools.
 - Connects to Deribit, authenticates, subscribes to order book, order updates, trade fills, and portfolio.
-- Signal engine processes every swap event and emits signals.
-- Execution manager places real limit orders on Deribit.
-- Risk manager runs a 1-second monitor loop checking stop-loss and take-profit conditions.
-- Periodic heartbeat logs system state.
+- Swap events flow through the RegimeFilter, LPMonitor, and FlowToxicityEngine pipeline.
+- When FTI exceeds the percentile threshold, regime is not CHAOTIC, and LP bias agrees — a ToxicitySignal is emitted.
+- Execution manager places real limit orders on Deribit with toxicity-adaptive sizing.
+- Risk manager runs a 1-second monitor loop with regime-aware stop-loss widening.
+- Periodic heartbeat logs regime, volatility, intensity, and position state.
 - Graceful shutdown on SIGINT/SIGTERM.
 
 ### 2. Paper Mode
@@ -80,28 +182,36 @@ What happens:
 
 ### 3. Backtest Mode
 
-Replays historical swap events stored in the SQLite database through the signal engine and simulates fills against 1 bps pool prices.
+Replays historical swap and liquidity events stored in the SQLite database through the full toxicity pipeline and simulates fills against 1 bps pool prices.
 
 ```yaml
 system:
   mode: "backtest"
 ```
 
-**Option A** — Run via `main.py` (backtests all configured pairs over the full dataset):
+**Option A** — Run via `main.py` (runs the toxicity backtest for all configured pairs):
 
 ```bash
 python main.py
 ```
 
-**Option B** — Run the dedicated backtest entry point (customizable time range):
+**Option B** — Run the dedicated backtest entry point with a custom time range:
 
 ```bash
 python backtest.py
 ```
 
-Edit `backtest.py`'s `main()` function to set the pair name and timestamp range:
+Edit `backtest.py`'s `main()` function. Use `run_toxicity()` for the FTI-based strategy, or `run()` for the legacy momentum strategy:
 
 ```python
+# Toxicity backtest
+result = await engine.run_toxicity(
+    pair_name="ETH-USDC",
+    start_timestamp=1700000000,
+    end_timestamp=1710000000,
+)
+
+# Legacy momentum backtest (for comparison)
 result = await engine.run(
     pair_name="ETH-USDC",
     start_timestamp=1700000000,
@@ -109,15 +219,14 @@ result = await engine.run(
 )
 ```
 
-What happens:
-- Does **not** connect to Arbitrum or Deribit.
-- Reads all swap events from the database in the specified time range.
-- Feeds them through the signal engine to generate signals.
-- Simulates order fills: for each entry signal, computes a limit price and scans forward through 1 bps pool events to see if the price crosses the limit within the staleness window.
-- Exits are simulated as market fills at the 1 bps pool price with configurable block lag.
-- Outputs: total signals, fill rate, win rate, average net return (bps), Sharpe ratio, max drawdown, total PnL, and an alpha decay curve.
+What happens in the toxicity backtest:
+- Reads all swap events and liquidity events from the database in the specified time range.
+- Feeds swaps through `RegimeFilter` + `LPMonitor` + `FlowToxicityEngine` to generate `ToxicitySignal`s.
+- Simulates order fills: computes toxicity-adaptive size and limit price, scans forward through 1 bps events to check if the price crosses within the staleness window.
+- Exits on toxicity exit signal, max holding time, or end of data.
+- Outputs: signals, fill rate, win rate, Sharpe ratio, max drawdown, total PnL, alpha decay curve, toxicity entry/exit counts, and regime distribution.
 
-**Populating data for backtesting:** Run the system in live or paper mode first to collect swap events into the database. Alternatively, import historical data directly into the `swap_events` table.
+**Populating data for backtesting:** Run the system in live or paper mode first to collect events into the database. Alternatively, import historical data directly into the `swap_events` and `liquidity_events` tables.
 
 ---
 
@@ -127,7 +236,11 @@ What happens:
 python -m pytest tests/ -v
 ```
 
-The test suite covers:
+The test suite covers 54 tests across 7 files:
+
+- **Flow Toxicity** (18 tests): directional FTI, coherence boosts (isolated 30bps vs. aligned), incoherent tier suppression, exit on low percentile, CHAOTIC regime blocking, position close state reset, OFI computation (5 edge cases), OFI concentration (high/capped), cluster ratio (all/none/partial/single), cross-excitation (forward/reverse/symmetric/empty), clustered flow amplification.
+- **Regime Filter** (7 tests): QUIET/ACTIVE/CHAOTIC classification, intensity tracking, regime multiplier values, window expiry, unknown pair defaults.
+- **LP Monitor** (8 tests): mint/burn above/below tick bias direction, straddling range 50/50 split, window expiry, edge cases.
 - **Signal Engine** (7 tests): conviction accumulation, hysteresis, momentum flag, autocorrelation filtering, transition detection, decay over time.
 - **Execution Manager** (5 tests): order placement, exit logic, reversals, staleness cancellation, signal-proportional sizing.
 - **Risk Manager** (5 tests): cooldown rejection, position limits, daily loss limits, stop-loss/take-profit triggers.
@@ -143,73 +256,99 @@ All configuration lives in `config.yaml`. Each section is documented below.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `log_level` | string | `"INFO"` | Python logging level. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`. `DEBUG` logs every swap event and signal recomputation. |
-| `heartbeat_interval_seconds` | int | `60` | How often (in seconds) the system logs a status heartbeat showing current signal, conviction, and position for each pair. |
-| `database_path` | string | `"data/events.db"` | Path to the SQLite database file. Created automatically if it doesn't exist. Parent directories are created as needed. |
-| `mode` | string | `"live"` | Operating mode: `"live"` (real orders), `"paper"` (simulated orders), or `"backtest"` (replay historical data). |
+| `log_level` | string | `"INFO"` | Python logging level. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
+| `heartbeat_interval_seconds` | int | `60` | How often the system logs a status heartbeat showing regime, vol, intensity, and position for each pair. |
+| `database_path` | string | `"data/events.db"` | Path to the SQLite database file. Created automatically. |
+| `mode` | string | `"live"` | Operating mode: `"live"`, `"paper"`, or `"backtest"`. |
 
 ### `infrastructure`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `rpc_url` | string | — | WebSocket RPC endpoint for Arbitrum. Must be a `wss://` URL. Used to subscribe to on-chain Swap events. |
+| `rpc_url` | string | — | WebSocket RPC endpoint for Arbitrum (`wss://` URL). |
 | `chain_id` | int | `42161` | EVM chain ID. `42161` = Arbitrum One mainnet. |
-| `block_confirmations` | int | `1` | Number of block confirmations before processing events. Higher values increase latency but reduce reorg risk. |
-| `reconnect_delay_seconds` | int | `5` | Seconds to wait before attempting to reconnect after an RPC WebSocket disconnect. |
-| `max_reconnect_attempts` | int | `50` | Maximum consecutive reconnection attempts before the system shuts down with an error. |
+| `block_confirmations` | int | `1` | Block confirmations before processing events. |
+| `reconnect_delay_seconds` | int | `5` | Seconds to wait before reconnecting after a disconnect. |
+| `max_reconnect_attempts` | int | `50` | Maximum consecutive reconnection attempts. |
 
 ### `deribit`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `base_url` | string | `"https://www.deribit.com"` | Deribit REST API base URL. Use `"https://test.deribit.com"` for testnet. |
-| `ws_url` | string | `"wss://www.deribit.com/ws/api/v2"` | Deribit WebSocket endpoint. Use `"wss://test.deribit.com/ws/api/v2"` for testnet. |
-| `client_id` | string | — | Deribit API client ID. Typically loaded from environment via `${DERIBIT_CLIENT_ID}`. |
-| `client_secret` | string | — | Deribit API client secret. Typically loaded from environment via `${DERIBIT_CLIENT_SECRET}`. |
+| `ws_url` | string | `"wss://www.deribit.com/ws/api/v2"` | Deribit WebSocket endpoint. |
+| `client_id` | string | — | API client ID, typically `${DERIBIT_CLIENT_ID}`. |
+| `client_secret` | string | — | API client secret, typically `${DERIBIT_CLIENT_SECRET}`. |
 
 ### `pairs[]`
 
-Each entry in the `pairs` list configures one trading pair. The system processes all pairs concurrently.
+Each entry configures one trading pair. The system processes all pairs concurrently.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `name` | string | Human-readable pair name, e.g. `"ETH-USDC"`. Used as the key throughout the system. |
-| `deribit_instrument` | string | Deribit perpetual contract name, e.g. `"ETH-PERPETUAL"`. |
-| `token0` | string | Contract address of token0 in the Uniswap V3 pool on Arbitrum. |
-| `token1` | string | Contract address of token1 in the Uniswap V3 pool on Arbitrum. |
-| `token0_decimals` | int | Decimal places for token0 (e.g. 18 for WETH). Used to convert raw pool prices. |
-| `token1_decimals` | int | Decimal places for token1 (e.g. 6 for USDC). Used to convert raw pool prices. |
-| `invert_price` | bool | If `true`, the price is inverted (1/P) after decimal adjustment. Set to `true` when the pool's native price is base/quote but you want quote/base. |
+| `name` | string | Human-readable pair name, e.g. `"ETH-USDC"`. |
+| `deribit_instrument` | string | Deribit perpetual contract, e.g. `"ETH-PERPETUAL"`. |
+| `token0` / `token1` | string | Contract addresses on Arbitrum. |
+| `token0_decimals` / `token1_decimals` | int | Decimal places for each token (18 for WETH, 6 for USDC). |
+| `invert_price` | bool | If `true`, price is inverted (1/P) after decimal adjustment. |
 
 ### `pairs[].pools`
 
-Three Uniswap V3 pool addresses per pair, one for each fee tier:
+Three Uniswap V3 pool addresses per pair:
 
 | Key | Description |
 |-----|-------------|
-| `bp30` | The 30 bps (0.30%) fee tier pool. Used by Layer 1 of the signal engine for trend detection. This is the lowest-liquidity, most informationally rich pool. |
-| `bp5` | The 5 bps (0.05%) fee tier pool. Used by Layer 2 for momentum confirmation and autocorrelation measurement. |
-| `bp1` | The 1 bps (0.01%) fee tier pool. Used as a reference price source. In backtesting, it proxies the Deribit mid price for simulated fills. |
+| `bp30` | 30 bps fee tier pool — lowest liquidity, most informationally rich. Primary input to FTI. |
+| `bp5` | 5 bps fee tier pool — moderate liquidity. Cross-tier coherence input. |
+| `bp1` | 1 bps fee tier pool — highest frequency. Drives regime filter (realized vol). Price reference for backtesting. |
 
-Each pool has:
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `address` | string | Uniswap V3 pool contract address on Arbitrum. |
-| `fee` | int | Pool fee in hundredths of a basis point (3000 = 30 bps, 500 = 5 bps, 100 = 1 bps). |
+### `pairs[].toxicity`
 
-### `pairs[].signal`
-
-Controls the two-layer signal computation.
+Controls the Flow Toxicity Index computation.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `conviction_halflife_seconds` | float | `480` | Half-life for the exponential decay applied to conviction before each update. At 480s (8 min), conviction from a 30 bps event has halved in influence after 8 minutes. This lets conviction accumulate across a cluster of swaps spanning several minutes. |
-| `trend_entry_threshold` | float | `1.5` | Conviction must exceed this value for the trend state to transition to +1 or -1. Higher values require stronger evidence before entering a trend. |
-| `trend_exit_threshold` | float | `0.5` | If absolute conviction drops below this value, the trend state resets to 0 (neutral). Must be strictly less than `trend_entry_threshold`. The gap between exit and entry creates a hysteresis band that prevents rapid flip-flopping. |
-| `intensity_smoothing` | float | `0.85` | Exponential smoothing factor (beta) for the average inter-event time on the 30 bps pool. Values closer to 1.0 smooth more aggressively, dampening spikes. Used to compute event arrival intensity. |
-| `momentum_window_events` | int | `30` | Number of recent 5 bps log-returns to keep in the rolling window. Cumulative momentum and lag-1 autocorrelation are computed over this window. A 30-event window captures several minutes of flow. |
-| `min_autocorrelation` | float | `0.05` | Minimum lag-1 autocorrelation required for the momentum flag to activate. Ensures that price moves in the 5 bps pool exhibit serial correlation (trending behavior), not noise. |
-| `conviction_cap` | float | `3.0` | Maximum absolute value of conviction. Clamps conviction to [-cap, +cap] after every update. Prevents runaway conviction from one-sided markets. Also acts as the denominator in the combined signal's magnitude scaling. |
+| `bucket_seconds` | float | `30` | Duration (seconds) of each flow aggregation bucket. At 30s, the system computes one FTI value every 30 seconds. Shorter = more responsive but noisier. |
+| `tier_weight_30` | float | `6.0` | Weight for 30 bps pool flow in the FTI. The 6x default reflects that paying 30 bps is a 6x stronger information signal than 1 bps. |
+| `tier_weight_5` | float | `2.0` | Weight for 5 bps pool flow in the FTI. |
+| `tier_weight_1` | float | `1.0` | Weight for 1 bps pool flow in the FTI. |
+| `fti_percentile_threshold` | float | `0.80` | Only trade when the current FTI ranks in the top 20% of the trailing distribution. Higher = fewer but higher-quality trades. |
+| `coherence_isolated_boost` | float | `2.0` | FTI multiplier when only the 30 bps pool has flow (no 5 bps or 1 bps activity). This is the strongest informed-flow signal: someone is paying the highest fee and there's no arb activity following them. |
+| `coherence_aligned_boost` | float | `1.0` | FTI multiplier when all active tiers agree on direction. |
+| `trailing_hours` | int | `24` | How many hours of FTI history to maintain for percentile computation. |
+| `exit_fti_percentile` | float | `0.30` | Exit an existing position when FTI drops below the 30th percentile of the trailing distribution. |
+| `cluster_halflife_seconds` | float | `15.0` | Exponential decay half-life for Hawkes-inspired intensity computation. |
+| `cluster_window_seconds` | float | `5.0` | Two 30 bps events within this many seconds count as "clustered". High cluster ratio = informed order splitting. |
+| `cross_excitation_window_seconds` | float | `10.0` | Time window to detect 30bps→5bps event cascades (information flowing from expensive to cheap pool). |
+| `ofi_concentration_cap` | float | `5.0` | Maximum value for the OFI concentration ratio (`\|OFI_30\| / \|OFI_1\|`). Prevents extreme values in thin markets. |
+
+### `pairs[].regime`
+
+Controls the volatility regime filter.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `vol_window_seconds` | float | `300` | Rolling window (5 min) over which realized volatility is computed from 1 bps pool log-returns. |
+| `vol_quiet_threshold` | float | `0.0005` | Realized vol below this = QUIET regime. |
+| `vol_chaotic_threshold` | float | `0.003` | Realized vol above this = CHAOTIC regime. Between the two thresholds = ACTIVE. |
+| `intensity_window_seconds` | float | `60` | Window for measuring event arrival intensity (events/second). |
+| `chaotic_multiplier` | float | `0.3` | Position size multiplier in CHAOTIC regime (massively reduce exposure). |
+| `active_multiplier` | float | `1.5` | Position size multiplier in ACTIVE regime (best conditions for the strategy). |
+| `quiet_multiplier` | float | `1.0` | Position size multiplier in QUIET regime (normal sizing). |
+
+### `pairs[].signal` (legacy)
+
+Controls the original two-layer momentum signal. Still used by the legacy `SignalEngine` and `backtest.run()`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `conviction_halflife_seconds` | float | `480` | Half-life for exponential decay of conviction. |
+| `trend_entry_threshold` | float | `1.5` | Conviction threshold to enter a trend. |
+| `trend_exit_threshold` | float | `0.5` | Conviction threshold to exit a trend. |
+| `intensity_smoothing` | float | `0.85` | Smoothing factor for inter-event time. |
+| `momentum_window_events` | int | `30` | Rolling window size for 5 bps momentum. |
+| `min_autocorrelation` | float | `0.05` | Minimum lag-1 autocorrelation for momentum flag. |
+| `conviction_cap` | float | `3.0` | Max absolute conviction value. |
 
 ### `pairs[].execution`
 
@@ -217,105 +356,120 @@ Controls order placement behavior.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `offset_base_bps` | float | `2.0` | Minimum price offset (in basis points) from the Deribit mid price when placing limit orders. This is the tightest the order will be placed, even at maximum conviction. Provides room for the market to come to you. |
-| `offset_conviction_bps` | float | `6.0` | Additional offset (in bps) applied inversely proportional to signal conviction. At low conviction, the full 6 bps is added (total 8 bps offset). At maximum conviction, zero is added (total 2 bps offset). |
-| `stale_order_seconds` | float | `45` | If an order remains unfilled after this many seconds, it is automatically cancelled. Gives limit orders adequate time to fill while the market oscillates. |
-| `allow_reprice` | bool | `false` | Reserved for future use. When `true`, would allow the system to amend unfilled orders to a new price rather than cancel-and-replace. |
-| `max_reprice_bps` | float | `3.0` | Maximum price movement (in bps) allowed for a single reprice. Only relevant if `allow_reprice` is `true`. |
-| `post_only` | bool | `true` | When `true`, all limit orders are placed as post-only (maker only). If the order would immediately match, Deribit rejects it. This ensures the system always earns the maker rebate and avoids taker fees. |
+| `offset_base_bps` | float | `2.0` | Minimum price offset from mid price when placing limit orders. |
+| `offset_conviction_bps` | float | `6.0` | Additional offset inversely proportional to signal strength. |
+| `stale_order_seconds` | float | `45` | Cancel unfilled orders after this many seconds. |
+| `allow_reprice` | bool | `false` | Reserved for future use. |
+| `max_reprice_bps` | float | `3.0` | Maximum price movement for a reprice. |
+| `post_only` | bool | `true` | Place all orders as post-only (maker only). |
 
 ### `pairs[].risk`
 
-Controls position sizing limits and risk management.
+Controls risk management.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `max_position_usd` | float | `50000` | Maximum notional value (in USD) of a single order. Orders where `size * price` exceeds this are rejected by the risk manager. |
-| `max_position_contracts` | float | `100` | Maximum position size in contracts. Also serves as the base for signal-proportional sizing: `size = round(|S_t| * max_position_contracts)`. |
-| `stop_loss_bps` | float | `35` | If unrealized loss on an open position exceeds this many basis points, the risk manager immediately places a market order to close the position. Wide enough to tolerate normal noise without being shaken out. |
-| `take_profit_bps` | float | `50` | If unrealized profit exceeds this many basis points, the risk manager places an exit order. Lets winning trades run to capture the full momentum move. |
-| `cooldown_seconds` | float | `120` | After a stop-loss exit, no new orders for this pair are allowed for this many seconds. Prevents re-entering during choppy conditions that just caused a loss. |
-| `daily_loss_limit_usd` | float | `500` | Maximum cumulative net loss (in USD) allowed over the trailing 24 hours. If breached, all new orders for this pair are rejected until losses roll off. |
-| `max_open_orders` | int | `3` | Maximum number of simultaneously open (unfilled) orders per pair. |
-| `margin_usage_limit_pct` | float | `50` | Maximum percentage of account equity that can be consumed by margin. Checked via Deribit's account summary before each order. Must be between 1 and 100. |
-| `max_holding_seconds` | float | `1800` | Hard cap on how long a position can be held (30 minutes). If a position has been open for this many seconds, the risk manager force-exits it at market regardless of PnL or signal state. Set to 0 to disable. Prevents holding through regime changes or funding rate periods. |
+| `max_position_usd` | float | `50000` | Maximum notional value per order. |
+| `max_position_contracts` | float | `100` | Maximum position size. Base for toxicity-adaptive sizing. |
+| `stop_loss_bps` | float | `35` | Stop-loss threshold. **Regime-aware**: widened 1.5x in CHAOTIC, tightened 0.8x in QUIET. |
+| `take_profit_bps` | float | `50` | Take-profit threshold. |
+| `cooldown_seconds` | float | `120` | Post-stop-loss cooldown. |
+| `daily_loss_limit_usd` | float | `500` | Maximum 24h cumulative loss. |
+| `max_open_orders` | int | `3` | Maximum simultaneous unfilled orders per pair. |
+| `margin_usage_limit_pct` | float | `50` | Maximum margin usage as percentage of equity. |
+| `max_holding_seconds` | float | `1800` | Hard cap on position hold time (30 min). Set to 0 to disable. |
 
 ---
 
-## Position Sizing Logic
+## Position Sizing: Toxicity-Adaptive
 
-The system uses **signal-proportional sizing** combined with a **risk manager veto chain**. Here is exactly how the trade size is determined each time:
+### Step 1: FTI Computation
 
-### Step 1: Signal Magnitude
-
-The signal engine produces a combined signal S_t in the range [-1, +1]:
+Each 30-second bucket produces an FTI value using the full five-factor formula:
 
 ```
-S_t = T_30 * F_5 * min(|C_30| / C_max, 1)
+weighted_flow = 6.0 × flow_30 + 2.0 × flow_5 + 1.0 × flow_1
+
+FTI = sign(weighted_flow)
+    × log(1 + |weighted_flow|)
+    × coherence              (0 or 0.5 or 1.0 or 2.0)
+    × impact_asymmetry       (price_impact_30 / price_impact_5, capped at 5.0)
+    × ofi_concentration      (|OFI_30| / |OFI_1|, capped at 5.0)
+    × (1 + cluster_ratio)    (fraction of clustered 30bps events)
 ```
 
-Where:
-- **T_30** is the trend state from the 30 bps pool: +1 (bullish), -1 (bearish), or 0 (neutral).
-- **F_5** is the momentum flag from the 5 bps pool: 1 if momentum direction aligns with the trend AND lag-1 autocorrelation exceeds the minimum threshold; 0 otherwise.
-- **C_30** is the current conviction (accumulated directional evidence, decayed over time).
-- **C_max** is the conviction cap (default 3.0).
+The OFI for each tier is `(up_count - down_count) / (up_count + down_count)`, measuring directional breadth independent of dollar volume. OFI concentration amplifies FTI when informed flow is concentrated in the expensive pool (high OFI_30, low OFI_1).
 
-The **sign** of S_t determines the direction (LONG or SHORT). The **absolute value** determines how aggressively to size.
+The cluster ratio measures burst arrival: what fraction of consecutive 30 bps events occur within 5 seconds of each other. This is a Hawkes self-excitation proxy — informed traders split large orders into rapid sequences. Cross-excitation asymmetry (30bps→5bps vs. 5bps→30bps event following) is recorded in the flow bucket for analysis but not directly in the FTI formula (it serves as a monitoring/diagnostic signal for strategy tuning).
 
-### Step 2: Raw Size Calculation
+The absolute FTI is then ranked against the trailing 24 hours of FTI values to produce a percentile (0 to 1). Only buckets where the percentile exceeds `fti_percentile_threshold` (default 0.80 = top 20%) are considered for trading.
 
-The raw position size is computed as:
+### Step 2: Regime Multiplier
 
-```
-size = round(|S_t| * max_position_contracts)
-```
+The regime filter classifies the current market state and applies a multiplier:
 
-With a minimum of 1 contract. For example, with `max_position_contracts: 100`:
+| Regime | Realized Vol | Multiplier | Interpretation |
+|--------|-------------|------------|----------------|
+| QUIET | < 0.0005 | 1.0x | Low activity, signals are rare but clean |
+| ACTIVE | 0.0005 – 0.003 | 1.5x | Best regime — frequent, predictive signals |
+| CHAOTIC | > 0.003 | 0.3x (or skip) | Can't distinguish informed flow from panic |
 
-| Signal |S_t| | Computed Size |
-|-----------|---------------|
-| 0.3 | 30 contracts |
-| 0.5 | 50 contracts |
-| 0.8 | 80 contracts |
-| 1.0 | 100 contracts |
-
-This means that at low conviction the system takes a small position, and at high conviction it scales up to the maximum.
-
-### Step 3: Limit Price Offset
-
-The limit price is set as an offset from the current Deribit mid price, also scaled by conviction:
+### Step 3: Position Size
 
 ```
-offset_bps = offset_base_bps + offset_conviction_bps * (1 - |S_t|)
-offset_usd = mid_price * offset_bps / 10000
+size = round(FTI_percentile × regime_multiplier × max_position_contracts)
 ```
 
-- For a **LONG** entry: `limit_price = mid_price - offset_usd`
-- For a **SHORT** entry: `limit_price = mid_price + offset_usd`
+Example with `max_position_contracts = 100`:
 
-At high conviction (`|S_t|` near 1.0), the offset shrinks toward `offset_base_bps` only (tight, aggressive). At low conviction (`|S_t|` near 0), the offset widens to `offset_base_bps + offset_conviction_bps` (passive, more spread).
+| FTI Percentile | Regime | Multiplier | Size |
+|----------------|--------|------------|------|
+| 0.85 | ACTIVE | 1.5 | 128 → capped at 100 |
+| 0.90 | QUIET | 1.0 | 90 contracts |
+| 0.82 | ACTIVE | 1.5 | 123 → capped at 100 |
+| 0.95 | CHAOTIC | 0.3 | 29 contracts |
 
-The final price is rounded to the instrument's tick size (0.5 for ETH-PERPETUAL).
+### Step 4: Limit Price
 
-### Step 4: Risk Manager Approval
+Same offset logic as the legacy strategy, but using FTI percentile as the conviction proxy:
 
-Before the order is placed, the risk manager checks (in order):
+```
+offset_bps = offset_base_bps + offset_conviction_bps × (1 - FTI_percentile)
+```
+
+Higher toxicity percentile = tighter offset (more aggressive). Lower percentile = wider offset (more passive).
+
+### Step 5: Risk Manager Approval
+
+Before placing, the risk manager checks:
 
 1. **Cooldown** — Is this pair in a post-stop-loss cooldown period?
-2. **Daily Loss** — Has cumulative 24h net PnL exceeded the daily loss limit?
-3. **Position Limit** — Would the new total position exceed `max_position_contracts`?
-4. **Notional Limit** — Would `size * price` exceed `max_position_usd`?
-5. **Margin Check** — Would total margin usage exceed `margin_usage_limit_pct` of equity?
+2. **Daily Loss** — Has cumulative 24h net PnL exceeded the limit?
+3. **Position Limit** — Would total position exceed `max_position_contracts`?
+4. **Notional Limit** — Would `size × price` exceed `max_position_usd`?
+5. **Margin Check** — Would margin usage exceed the limit?
 
-If any check fails, the order is rejected and the reason is logged.
+### Step 6: Regime-Aware Stop-Loss
 
-### Step 5: Scaling and Reducing
+The stop-loss threshold adapts to the current regime:
 
-After the initial entry, if the signal magnitude changes while the direction stays the same:
+| Regime | Stop-Loss Adjustment |
+|--------|---------------------|
+| QUIET | 0.8× (tighter — less noise to tolerate) |
+| ACTIVE | 1.0× (default) |
+| CHAOTIC | 1.5× (wider — avoid premature stop-outs in high vol) |
 
-- **Scale up** (signal increased): An additional limit order is placed for the difference between the current position and the new target size.
-- **Reduce** (signal decreased): A reduce-only limit order is placed to trim the position down to the new target size.
-- **Reversal** (direction flipped): The current position is closed at market, then a new entry is placed in the opposite direction.
-- **Exit** (signal went to zero): All open orders are cancelled and the position is closed at market.
+---
 
-This means the position size is continuously adjusted to match the system's current conviction level.
+## Database Schema
+
+The SQLite database stores six tables:
+
+| Table | Purpose |
+|-------|---------|
+| `swap_events` | Every Uniswap V3 Swap event across all three pools |
+| `liquidity_events` | Every Mint/Burn event (LP additions/removals) |
+| `flow_buckets` | Aggregated per-bucket flow data with per-tier breakdowns, OFI values, cluster ratio, and cross-excitation |
+| `signal_log` | Legacy signal engine state snapshots |
+| `order_log` | All orders (placed, filled, cancelled) |
+| `trade_log` | Completed round-trip trades with PnL |

@@ -9,15 +9,20 @@ from pydantic import BaseModel
 
 from config import Config, load_config
 from database import Database
+from flow_toxicity import FlowToxicityEngine
 from logger import setup_logger
+from lp_monitor import LPMonitor
 from models import (
     Direction,
     FeeTier,
+    Regime,
     SignalState,
     SignalTransition,
     SwapEvent,
+    ToxicitySignal,
     TradeRecord,
 )
+from regime_filter import RegimeFilter
 from signal_engine import SignalEngine
 
 logger = setup_logger()
@@ -42,6 +47,9 @@ class BacktestResult(BaseModel):
     trades: list[TradeRecord]
     equity_curve: list[tuple[float, float]]
     alpha_decay_curve: list[tuple[int, float]] = []
+    toxicity_entry_count: int = 0
+    toxicity_exit_count: int = 0
+    regime_distribution: dict[str, int] = {}
 
 
 class _SimulatedPosition:
@@ -243,6 +251,225 @@ class BacktestEngine:
             pair_name, start_timestamp, end_timestamp,
             len(signals_emitted), filled_count, trades, alpha_decay,
         )
+        return result
+
+    async def run_toxicity(
+        self,
+        pair_name: str,
+        start_timestamp: int,
+        end_timestamp: int,
+    ) -> BacktestResult:
+        pair_cfg = self._config.get_pair(pair_name)
+        ex = pair_cfg.execution
+        risk = pair_cfg.risk
+
+        events = await self._database.get_all_swap_events_in_range(
+            pair_name, start_timestamp, end_timestamp
+        )
+
+        liq_events = await self._database.get_liquidity_events_in_range(
+            pair_name, start_timestamp, end_timestamp
+        )
+
+        empty = BacktestResult(
+            pair_name=pair_name,
+            start_time=float(start_timestamp),
+            end_time=float(end_timestamp),
+            total_signals=0,
+            filled_signals=0,
+            fill_rate=0.0,
+            total_trades=0,
+            win_rate=0.0,
+            avg_gross_return_bps=0.0,
+            avg_net_return_bps=0.0,
+            total_pnl_usd=0.0,
+            max_drawdown_usd=0.0,
+            max_drawdown_bps=0.0,
+            sharpe_ratio=0.0,
+            avg_holding_seconds=0.0,
+            trades=[],
+            equity_curve=[],
+        )
+
+        if not events:
+            return empty
+
+        logger.info(
+            "Toxicity backtest starting",
+            pair=pair_name,
+            swap_events=len(events),
+            liq_events=len(liq_events),
+        )
+
+        regime_filter = RegimeFilter(self._config)
+        lp_monitor = LPMonitor(self._config)
+
+        signals_emitted: list[ToxicitySignal] = []
+        regime_counts: dict[str, int] = {"quiet": 0, "active": 0, "chaotic": 0}
+
+        async def capture_toxicity(sig: ToxicitySignal) -> None:
+            signals_emitted.append(sig)
+
+        toxicity_engine = FlowToxicityEngine(
+            self._config,
+            self._database,
+            regime_filter,
+            lp_monitor,
+            capture_toxicity,
+        )
+
+        liq_idx = 0
+        for event in events:
+            regime_filter.on_swap(event)
+            lp_monitor.update_current_tick(event.pair_name, event.tick)
+
+            while liq_idx < len(liq_events) and liq_events[liq_idx].block_timestamp <= event.block_timestamp:
+                lp_monitor.on_liquidity_event(liq_events[liq_idx])
+                liq_idx += 1
+
+            await toxicity_engine.on_swap(event)
+
+            regime = regime_filter.get_regime(pair_name)
+            regime_counts[regime.value] += 1
+
+        bp1_events = [e for e in events if e.fee_tier == FeeTier.BP1]
+        bp1_prices = {e.block_timestamp: e.price for e in bp1_events}
+        bp1_timestamps = sorted(bp1_prices.keys())
+
+        trades: list[TradeRecord] = []
+        position: Optional[_SimulatedPosition] = None
+        filled_count = 0
+        max_hold = risk.max_holding_seconds
+        tox_entries = 0
+        tox_exits = 0
+
+        for sig in signals_emitted:
+            if position is not None and max_hold > 0:
+                if sig.timestamp - position.entry_time >= max_hold:
+                    exit_price = self._get_bp1_price(
+                        sig.timestamp, bp1_prices, bp1_timestamps
+                    )
+                    if exit_price is not None:
+                        trade = self._close_position(
+                            position, exit_price, sig.timestamp,
+                            "max_holding_time", pair_name, pair_cfg.deribit_instrument,
+                        )
+                        trades.append(trade)
+                    position = None
+
+            if sig.transition == SignalTransition.ENTRY:
+                if position is not None:
+                    continue
+
+                ref_price = self._get_bp1_price(sig.timestamp, bp1_prices, bp1_timestamps)
+                if ref_price is None:
+                    continue
+
+                direction = sig.direction
+                size = max(
+                    1,
+                    round(
+                        sig.fti_percentile
+                        * sig.regime_multiplier
+                        * risk.max_position_contracts
+                    ),
+                )
+                limit_price = self._compute_limit_price(
+                    ref_price, direction, sig.fti_percentile, ex
+                )
+
+                fill_price, fill_time = self._scan_for_fill(
+                    direction, limit_price, sig.timestamp,
+                    ex.stale_order_seconds, bp1_events,
+                )
+
+                if fill_price is not None:
+                    position = _SimulatedPosition(
+                        direction=direction,
+                        size=float(size),
+                        entry_price=fill_price,
+                        entry_time=fill_time,
+                        signal_at_entry=sig.fti,
+                    )
+                    filled_count += 1
+                    tox_entries += 1
+
+            elif sig.transition in (SignalTransition.EXIT, SignalTransition.REVERSAL):
+                if position is not None:
+                    exit_price = self._get_bp1_price_with_lag(
+                        sig.timestamp, bp1_events
+                    )
+                    if exit_price is None:
+                        exit_price = self._get_bp1_price(
+                            sig.timestamp, bp1_prices, bp1_timestamps
+                        )
+                    if exit_price is None:
+                        continue
+
+                    reason = (
+                        "toxicity_reversal"
+                        if sig.transition == SignalTransition.REVERSAL
+                        else "toxicity_exit"
+                    )
+                    trade = self._close_position(
+                        position, exit_price, sig.timestamp,
+                        reason, pair_name, pair_cfg.deribit_instrument,
+                    )
+                    trades.append(trade)
+                    position = None
+                    tox_exits += 1
+
+                if sig.transition == SignalTransition.REVERSAL:
+                    ref_price = self._get_bp1_price(
+                        sig.timestamp, bp1_prices, bp1_timestamps
+                    )
+                    if ref_price is None:
+                        continue
+                    direction = sig.direction
+                    size = max(
+                        1,
+                        round(
+                            sig.fti_percentile
+                            * sig.regime_multiplier
+                            * risk.max_position_contracts
+                        ),
+                    )
+                    limit_price = self._compute_limit_price(
+                        ref_price, direction, sig.fti_percentile, ex,
+                    )
+                    fill_price, fill_time = self._scan_for_fill(
+                        direction, limit_price, sig.timestamp,
+                        ex.stale_order_seconds, bp1_events,
+                    )
+                    if fill_price is not None:
+                        position = _SimulatedPosition(
+                            direction=direction,
+                            size=float(size),
+                            entry_price=fill_price,
+                            entry_time=fill_time,
+                            signal_at_entry=sig.fti,
+                        )
+                        filled_count += 1
+                        tox_entries += 1
+
+        if position is not None and bp1_events:
+            last_price = bp1_events[-1].price
+            last_ts = float(bp1_events[-1].block_timestamp)
+            trade = self._close_position(
+                position, last_price, last_ts, "end_of_backtest",
+                pair_name, pair_cfg.deribit_instrument,
+            )
+            trades.append(trade)
+
+        alpha_decay = self._compute_alpha_decay(events)
+
+        result = self._compute_metrics(
+            pair_name, start_timestamp, end_timestamp,
+            len(signals_emitted), filled_count, trades, alpha_decay,
+        )
+        result.toxicity_entry_count = tox_entries
+        result.toxicity_exit_count = tox_exits
+        result.regime_distribution = regime_counts
         return result
 
     @staticmethod

@@ -120,6 +120,32 @@ class RiskConfig(BaseModel):
         return v
 
 
+class ToxicityConfig(BaseModel):
+    bucket_seconds: float = 30
+    tier_weight_30: float = 6.0
+    tier_weight_5: float = 2.0
+    tier_weight_1: float = 1.0
+    fti_percentile_threshold: float = 0.80
+    coherence_isolated_boost: float = 2.0
+    coherence_aligned_boost: float = 1.0
+    trailing_hours: int = 24
+    exit_fti_percentile: float = 0.30
+    cluster_halflife_seconds: float = 15.0
+    cluster_window_seconds: float = 5.0
+    cross_excitation_window_seconds: float = 10.0
+    ofi_concentration_cap: float = 5.0
+
+
+class RegimeConfig(BaseModel):
+    vol_window_seconds: float = 300
+    vol_quiet_threshold: float = 0.0005
+    vol_chaotic_threshold: float = 0.003
+    intensity_window_seconds: float = 60
+    chaotic_multiplier: float = 0.3
+    active_multiplier: float = 1.5
+    quiet_multiplier: float = 1.0
+
+
 class PairConfig(BaseModel):
     name: str
     deribit_instrument: str
@@ -132,6 +158,8 @@ class PairConfig(BaseModel):
     signal: SignalConfig = SignalConfig()
     execution: ExecutionConfig = ExecutionConfig()
     risk: RiskConfig = RiskConfig()
+    toxicity: ToxicityConfig = ToxicityConfig()
+    regime: RegimeConfig = RegimeConfig()
 
 
 class Config(BaseModel):

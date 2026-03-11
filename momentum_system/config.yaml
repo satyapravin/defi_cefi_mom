@@ -60,3 +60,25 @@ pairs:
       max_open_orders: 3
       margin_usage_limit_pct: 50
       max_holding_seconds: 1800             # force-exit after 30 minutes
+    toxicity:
+      bucket_seconds: 30                    # aggregate flow into 30s windows
+      tier_weight_30: 6.0                   # 30bps swaps weighted 6x
+      tier_weight_5: 2.0                    # 5bps swaps weighted 2x
+      tier_weight_1: 1.0                    # 1bps swaps weighted 1x
+      fti_percentile_threshold: 0.80        # only trade top 20% of FTI values
+      coherence_isolated_boost: 2.0         # boost when only 30bps has flow
+      coherence_aligned_boost: 1.0          # all tiers agree
+      trailing_hours: 24                    # percentile lookback
+      exit_fti_percentile: 0.30             # exit when FTI drops below 30th pctl
+      cluster_halflife_seconds: 15.0         # exp decay for Hawkes-inspired intensity
+      cluster_window_seconds: 5.0           # two 30bps events within 5s = cluster
+      cross_excitation_window_seconds: 10.0  # 30bps→5bps within 10s = info cascade
+      ofi_concentration_cap: 5.0            # cap |OFI_30|/|OFI_1| ratio
+    regime:
+      vol_window_seconds: 300               # 5 min rolling vol
+      vol_quiet_threshold: 0.0005           # below = QUIET
+      vol_chaotic_threshold: 0.003          # above = CHAOTIC
+      intensity_window_seconds: 60
+      chaotic_multiplier: 0.3               # size multiplier in CHAOTIC
+      active_multiplier: 1.5                # size multiplier in ACTIVE
+      quiet_multiplier: 1.0                 # size multiplier in QUIET

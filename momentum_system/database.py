@@ -9,6 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from models import (
     FeeTier,
+    FlowBucket,
+    LiquidityAction,
+    LiquidityEvent,
     SwapEvent,
     SignalState,
     OrderState,
@@ -90,6 +93,50 @@ CREATE TABLE IF NOT EXISTS trade_log (
     created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS liquidity_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_name TEXT NOT NULL,
+    fee_tier TEXT NOT NULL,
+    block_number INTEGER NOT NULL,
+    block_timestamp INTEGER NOT NULL,
+    transaction_hash TEXT NOT NULL,
+    pool_address TEXT NOT NULL,
+    action TEXT NOT NULL,
+    tick_lower INTEGER NOT NULL,
+    tick_upper INTEGER NOT NULL,
+    amount TEXT NOT NULL,
+    amount0 TEXT NOT NULL,
+    amount1 TEXT NOT NULL,
+    current_tick INTEGER,
+    created_at REAL NOT NULL,
+    UNIQUE(transaction_hash, pool_address, action, tick_lower, tick_upper)
+);
+
+CREATE TABLE IF NOT EXISTS flow_buckets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_name TEXT NOT NULL,
+    bucket_start REAL NOT NULL,
+    bucket_end REAL NOT NULL,
+    flow_30 REAL NOT NULL,
+    flow_5 REAL NOT NULL,
+    flow_1 REAL NOT NULL,
+    volume_30 REAL NOT NULL,
+    volume_5 REAL NOT NULL,
+    volume_1 REAL NOT NULL,
+    price_move_30 REAL NOT NULL,
+    price_move_5 REAL NOT NULL,
+    price_move_1 REAL NOT NULL,
+    event_count_30 INTEGER NOT NULL,
+    event_count_5 INTEGER NOT NULL,
+    event_count_1 INTEGER NOT NULL,
+    ofi_30 REAL NOT NULL DEFAULT 0,
+    ofi_5 REAL NOT NULL DEFAULT 0,
+    ofi_1 REAL NOT NULL DEFAULT 0,
+    cluster_ratio_30 REAL NOT NULL DEFAULT 0,
+    cross_excitation REAL NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_swap_pair_tier
     ON swap_events(pair_name, fee_tier, block_timestamp);
 
@@ -98,6 +145,12 @@ CREATE INDEX IF NOT EXISTS idx_signal_pair
 
 CREATE INDEX IF NOT EXISTS idx_trade_pair
     ON trade_log(pair_name, exit_time);
+
+CREATE INDEX IF NOT EXISTS idx_liq_pair_tier
+    ON liquidity_events(pair_name, fee_tier, block_timestamp);
+
+CREATE INDEX IF NOT EXISTS idx_bucket_pair
+    ON flow_buckets(pair_name, bucket_end);
 """
 
 
@@ -348,6 +401,132 @@ class Database:
                 net_pnl_usd=r[10],
                 signal_at_entry=r[11],
                 exit_reason=r[12],
+            )
+            for r in rows
+        ]
+
+    async def insert_liquidity_event(self, event: LiquidityEvent) -> None:
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text(
+                    """INSERT OR IGNORE INTO liquidity_events
+                    (pair_name, fee_tier, block_number, block_timestamp,
+                     transaction_hash, pool_address, action, tick_lower,
+                     tick_upper, amount, amount0, amount1, current_tick,
+                     created_at)
+                    VALUES
+                    (:pair_name, :fee_tier, :block_number, :block_timestamp,
+                     :tx_hash, :pool_address, :action, :tick_lower,
+                     :tick_upper, :amount, :amount0, :amount1, :current_tick,
+                     :created_at)"""
+                ),
+                {
+                    "pair_name": event.pair_name,
+                    "fee_tier": event.fee_tier.value,
+                    "block_number": event.block_number,
+                    "block_timestamp": event.block_timestamp,
+                    "tx_hash": event.transaction_hash,
+                    "pool_address": event.pool_address,
+                    "action": event.action.value,
+                    "tick_lower": event.tick_lower,
+                    "tick_upper": event.tick_upper,
+                    "amount": str(event.amount),
+                    "amount0": str(event.amount0),
+                    "amount1": str(event.amount1),
+                    "current_tick": event.current_tick,
+                    "created_at": time.time(),
+                },
+            )
+
+    async def insert_flow_bucket(self, bucket: FlowBucket) -> None:
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text(
+                    """INSERT INTO flow_buckets
+                    (pair_name, bucket_start, bucket_end,
+                     flow_30, flow_5, flow_1,
+                     volume_30, volume_5, volume_1,
+                     price_move_30, price_move_5, price_move_1,
+                     event_count_30, event_count_5, event_count_1,
+                     ofi_30, ofi_5, ofi_1,
+                     cluster_ratio_30, cross_excitation,
+                     created_at)
+                    VALUES
+                    (:pair_name, :bucket_start, :bucket_end,
+                     :flow_30, :flow_5, :flow_1,
+                     :volume_30, :volume_5, :volume_1,
+                     :price_move_30, :price_move_5, :price_move_1,
+                     :event_count_30, :event_count_5, :event_count_1,
+                     :ofi_30, :ofi_5, :ofi_1,
+                     :cluster_ratio_30, :cross_excitation,
+                     :created_at)"""
+                ),
+                {
+                    "pair_name": bucket.pair_name,
+                    "bucket_start": bucket.bucket_start,
+                    "bucket_end": bucket.bucket_end,
+                    "flow_30": bucket.flow_30,
+                    "flow_5": bucket.flow_5,
+                    "flow_1": bucket.flow_1,
+                    "volume_30": bucket.volume_30,
+                    "volume_5": bucket.volume_5,
+                    "volume_1": bucket.volume_1,
+                    "price_move_30": bucket.price_move_30,
+                    "price_move_5": bucket.price_move_5,
+                    "price_move_1": bucket.price_move_1,
+                    "event_count_30": bucket.event_count_30,
+                    "event_count_5": bucket.event_count_5,
+                    "event_count_1": bucket.event_count_1,
+                    "ofi_30": bucket.ofi_30,
+                    "ofi_5": bucket.ofi_5,
+                    "ofi_1": bucket.ofi_1,
+                    "cluster_ratio_30": bucket.cluster_ratio_30,
+                    "cross_excitation": bucket.cross_excitation,
+                    "created_at": time.time(),
+                },
+            )
+
+    async def get_liquidity_events_in_range(
+        self,
+        pair_name: str,
+        start_timestamp: int,
+        end_timestamp: int,
+    ) -> list[LiquidityEvent]:
+        async with self._engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    """SELECT pair_name, fee_tier, block_number, block_timestamp,
+                              transaction_hash, pool_address, action, tick_lower,
+                              tick_upper, amount, amount0, amount1, current_tick
+                       FROM liquidity_events
+                       WHERE pair_name = :pair_name
+                         AND block_timestamp >= :start_ts
+                         AND block_timestamp <= :end_ts
+                       ORDER BY block_timestamp ASC, id ASC"""
+                ),
+                {
+                    "pair_name": pair_name,
+                    "start_ts": start_timestamp,
+                    "end_ts": end_timestamp,
+                },
+            )
+            rows = result.fetchall()
+
+        return [
+            LiquidityEvent(
+                pair_name=r[0],
+                fee_tier=FeeTier(r[1]),
+                block_number=r[2],
+                block_timestamp=r[3],
+                transaction_hash=r[4],
+                pool_address=r[5],
+                action=LiquidityAction(r[6]),
+                tick_lower=r[7],
+                tick_upper=r[8],
+                amount=int(r[9]),
+                amount0=int(r[10]),
+                amount1=int(r[11]),
+                current_tick=r[12],
             )
             for r in rows
         ]

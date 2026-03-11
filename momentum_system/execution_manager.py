@@ -4,7 +4,7 @@ import asyncio
 import math
 import time
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
 from config import Config
 from database import Database
@@ -16,8 +16,10 @@ from models import (
     OrderState,
     OrderStatus,
     Position,
+    Regime,
     SignalState,
     SignalTransition,
+    ToxicitySignal,
     TradeRecord,
 )
 from risk_manager import RiskManager
@@ -52,6 +54,138 @@ class ExecutionManager:
         self._open_orders: dict[str, OrderState] = {}
         self._positions: dict[str, Position] = {}
         self._stale_tasks: dict[str, asyncio.Task] = {}
+        self._on_position_closed: Optional[Callable[[str], None]] = None
+
+    async def on_toxicity_signal(self, signal: ToxicitySignal) -> None:
+        pair = signal.pair_name
+        logger.info(
+            "Toxicity signal received",
+            pair=pair,
+            transition=signal.transition.value,
+            fti=round(signal.fti, 4),
+            pctl=round(signal.fti_percentile, 2),
+            regime=signal.regime.value,
+        )
+
+        if signal.transition == SignalTransition.ENTRY:
+            await self._handle_toxicity_entry(pair, signal)
+        elif signal.transition == SignalTransition.EXIT:
+            await self._handle_toxicity_exit(pair, signal)
+        elif signal.transition == SignalTransition.REVERSAL:
+            await self._handle_toxicity_exit(pair, signal)
+            await self._handle_toxicity_entry(pair, signal)
+
+    async def _handle_toxicity_entry(
+        self, pair: str, signal: ToxicitySignal
+    ) -> None:
+        pair_cfg = self._config.get_pair(pair)
+        instrument = pair_cfg.deribit_instrument
+        ex = pair_cfg.execution
+        risk = pair_cfg.risk
+
+        mid = self._deribit.get_mid_price(instrument)
+        if mid is None:
+            logger.warning("No mid price, skipping toxicity entry", pair=pair)
+            return
+
+        direction = signal.direction
+        size = max(
+            1,
+            round(
+                signal.fti_percentile
+                * signal.regime_multiplier
+                * risk.max_position_contracts
+            ),
+        )
+
+        limit_price = self._compute_limit_price(
+            mid, direction, signal.fti_percentile, ex
+        )
+        limit_price = _round_to_tick(limit_price, instrument)
+
+        request = OrderRequest(
+            pair_name=pair,
+            instrument=instrument,
+            direction=direction,
+            size=float(size),
+            limit_price=limit_price,
+            post_only=ex.post_only,
+            label=f"tox_entry_{uuid.uuid4().hex[:8]}",
+        )
+
+        approved, reason = await self._risk.approve_order(request)
+        if not approved:
+            logger.warning("Toxicity order rejected by risk", pair=pair, reason=reason)
+            return
+
+        if self._mode == "live":
+            order_id = await self._deribit.place_order(request)
+        else:
+            order_id = f"paper_{uuid.uuid4().hex[:8]}"
+            logger.info(
+                "Paper: toxicity entry",
+                order_id=order_id,
+                pair=pair,
+                direction=direction.name,
+                size=size,
+                price=limit_price,
+                fti_pctl=round(signal.fti_percentile, 2),
+                regime=signal.regime.value,
+            )
+
+        order_state = OrderState(
+            order_id=order_id,
+            request=request,
+            status=OrderStatus.PLACED,
+            placed_at=time.time(),
+        )
+        self._open_orders[order_id] = order_state
+        await self._database.insert_order(order_state)
+
+        task = asyncio.create_task(self._stale_check(order_id, pair))
+        self._stale_tasks[order_id] = task
+
+    async def _handle_toxicity_exit(
+        self, pair: str, signal: ToxicitySignal
+    ) -> None:
+        pair_cfg = self._config.get_pair(pair)
+        instrument = pair_cfg.deribit_instrument
+
+        await self._cancel_pair_orders(pair)
+
+        pos = self._positions.get(pair)
+        if pos and pos.size > 0:
+            close_dir = (
+                Direction.SHORT
+                if pos.direction == Direction.LONG
+                else Direction.LONG
+            )
+            mid = self._deribit.get_mid_price(instrument)
+
+            if self._mode == "live":
+                await self._deribit.place_market_order(
+                    instrument, close_dir, pos.size, reduce_only=True
+                )
+            else:
+                logger.info(
+                    "Paper: toxicity exit",
+                    pair=pair,
+                    direction=close_dir.name,
+                    size=pos.size,
+                )
+
+            exit_price = mid if mid else pos.entry_price
+            await self._record_trade(pos, exit_price, "toxicity_exit")
+            self._positions.pop(pair, None)
+            self._risk.update_position(pair, None)
+
+            if self._on_position_closed:
+                self._on_position_closed(pair)
+
+    def set_on_position_closed(
+        self, callback: Callable[[str], None]
+    ) -> None:
+        self._on_position_closed = callback
 
     async def on_signal(self, state: SignalState) -> None:
         pair = state.pair_name
@@ -106,6 +240,9 @@ class ExecutionManager:
             await self._record_trade(pos, exit_price, reason)
             self._positions.pop(pair_name, None)
             self._risk.update_position(pair_name, None)
+
+            if self._on_position_closed:
+                self._on_position_closed(pair_name)
 
     async def _handle_entry(self, pair: str, state: SignalState) -> None:
         pair_cfg = self._config.get_pair(pair)

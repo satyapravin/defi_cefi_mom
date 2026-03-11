@@ -34,6 +34,17 @@ class OrderStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class Regime(str, Enum):
+    QUIET = "quiet"
+    ACTIVE = "active"
+    CHAOTIC = "chaotic"
+
+
+class LiquidityAction(str, Enum):
+    MINT = "mint"
+    BURN = "burn"
+
+
 class SwapEvent(BaseModel):
     pair_name: str
     fee_tier: FeeTier
@@ -111,3 +122,58 @@ class TradeRecord(BaseModel):
     net_pnl_usd: float
     signal_at_entry: float
     exit_reason: str
+
+
+# --------------- Toxic Flow Oracle models ---------------
+
+
+class LiquidityEvent(BaseModel):
+    pair_name: str
+    fee_tier: FeeTier
+    block_number: int
+    block_timestamp: int
+    transaction_hash: str
+    pool_address: str
+    action: LiquidityAction
+    tick_lower: int
+    tick_upper: int
+    amount: int
+    amount0: int
+    amount1: int
+    current_tick: Optional[int] = None
+
+
+class FlowBucket(BaseModel):
+    pair_name: str
+    bucket_start: float
+    bucket_end: float
+    flow_30: float = 0.0
+    flow_5: float = 0.0
+    flow_1: float = 0.0
+    volume_30: float = 0.0
+    volume_5: float = 0.0
+    volume_1: float = 0.0
+    price_move_30: float = 0.0
+    price_move_5: float = 0.0
+    price_move_1: float = 0.0
+    event_count_30: int = 0
+    event_count_5: int = 0
+    event_count_1: int = 0
+    ofi_30: float = 0.0
+    ofi_5: float = 0.0
+    ofi_1: float = 0.0
+    cluster_ratio_30: float = 0.0
+    cross_excitation: float = 0.0
+
+
+class ToxicitySignal(BaseModel):
+    pair_name: str
+    timestamp: float
+    fti: float
+    fti_percentile: float
+    direction: Direction
+    regime: Regime
+    lp_bias: float
+    coherence: float
+    transition: SignalTransition
+    regime_multiplier: float

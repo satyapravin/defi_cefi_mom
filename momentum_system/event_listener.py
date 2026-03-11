@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 
 from web3 import AsyncWeb3, WebSocketProvider
 from web3.types import LogReceipt
@@ -10,11 +10,13 @@ from web3.types import LogReceipt
 from config import Config, PairConfig
 from database import Database
 from logger import setup_logger
-from models import FeeTier, SwapEvent
+from models import FeeTier, LiquidityAction, LiquidityEvent, SwapEvent
 
 logger = setup_logger()
 
 SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+MINT_TOPIC = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde"
+BURN_TOPIC = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c"
 
 
 class EventListener:
@@ -22,15 +24,18 @@ class EventListener:
         self,
         config: Config,
         database: Database,
-        on_event: Callable[[SwapEvent], Awaitable[None]],
+        on_swap: Callable[[SwapEvent], Awaitable[None]],
+        on_liquidity: Optional[Callable[[LiquidityEvent], Awaitable[None]]] = None,
     ):
         self._config = config
         self._database = database
-        self._on_event = on_event
+        self._on_swap = on_swap
+        self._on_liquidity = on_liquidity
         self._w3: AsyncWeb3 | None = None
         self._tasks: list[asyncio.Task] = []
         self._running = False
         self._last_price: dict[str, float] = {}
+        self._last_tick: dict[str, int] = {}
 
         self._pool_map: dict[str, tuple[str, FeeTier, PairConfig]] = {}
         for pair_cfg in config.pairs:
@@ -66,18 +71,32 @@ class EventListener:
                 reconnect_attempts = 0
 
                 pool_addresses = list(self._pool_map.keys())
-                log_filter = await self._w3.eth.filter({
+                checksum_addrs = [
+                    AsyncWeb3.to_checksum_address(a) for a in pool_addresses
+                ]
+
+                swap_filter = await self._w3.eth.filter({
                     "topics": [SWAP_TOPIC],
-                    "address": [
-                        AsyncWeb3.to_checksum_address(a) for a in pool_addresses
-                    ],
+                    "address": checksum_addrs,
                 })
+
+                mint_burn_filter = None
+                if self._on_liquidity is not None:
+                    mint_burn_filter = await self._w3.eth.filter({
+                        "topics": [[MINT_TOPIC, BURN_TOPIC]],
+                        "address": checksum_addrs,
+                    })
 
                 while self._running:
                     try:
-                        logs = await log_filter.get_new_entries()
-                        for log_entry in logs:
-                            await self._process_log(log_entry)
+                        swap_logs = await swap_filter.get_new_entries()
+                        for log_entry in swap_logs:
+                            await self._process_swap_log(log_entry)
+
+                        if mint_burn_filter is not None:
+                            liq_logs = await mint_burn_filter.get_new_entries()
+                            for log_entry in liq_logs:
+                                await self._process_liquidity_log(log_entry)
                     except Exception as e:
                         if not self._running:
                             break
@@ -106,7 +125,7 @@ class EventListener:
         for task in self._tasks:
             task.cancel()
 
-    async def _process_log(self, log_entry: LogReceipt) -> None:
+    async def _process_swap_log(self, log_entry: LogReceipt) -> None:
         pool_address = log_entry["address"].lower()
         if pool_address not in self._pool_map:
             return
@@ -121,6 +140,8 @@ class EventListener:
             logger.error("Failed to parse swap log", error=str(e), tx=log_entry.get("transactionHash", b"").hex())
             return
 
+        self._last_tick[pool_address] = event.tick
+
         logger.debug(
             "swap_event",
             pair=pair_name,
@@ -130,7 +151,36 @@ class EventListener:
         )
 
         await self._database.insert_swap_event(event)
-        await self._on_event(event)
+        await self._on_swap(event)
+
+    async def _process_liquidity_log(self, log_entry: LogReceipt) -> None:
+        pool_address = log_entry["address"].lower()
+        if pool_address not in self._pool_map:
+            return
+
+        pair_name, fee_tier, pair_config = self._pool_map[pool_address]
+        topics = log_entry.get("topics", [])
+        if not topics:
+            return
+
+        topic0 = topics[0]
+        if isinstance(topic0, bytes):
+            topic0 = "0x" + topic0.hex()
+
+        try:
+            event = self._parse_liquidity_log(
+                log_entry, topic0, pair_name, fee_tier, pool_address
+            )
+        except Exception as e:
+            logger.error("Failed to parse liquidity log", error=str(e))
+            return
+
+        if event is None:
+            return
+
+        await self._database.insert_liquidity_event(event)
+        if self._on_liquidity:
+            await self._on_liquidity(event)
 
     def _parse_swap_log(
         self,
@@ -210,6 +260,83 @@ class EventListener:
         r = math.log(price) - math.log(prev)
         direction = 1 if r > 0 else (-1 if r < 0 else 0)
         return r, direction
+
+    def _parse_liquidity_log(
+        self,
+        log: LogReceipt,
+        topic0: str,
+        pair_name: str,
+        fee_tier: FeeTier,
+        pool_address: str,
+    ) -> Optional[LiquidityEvent]:
+        topics = log.get("topics", [])
+
+        if topic0 == MINT_TOPIC:
+            action = LiquidityAction.MINT
+            if len(topics) < 4:
+                return None
+            tick_lower = self._decode_int24(topics[2])
+            tick_upper = self._decode_int24(topics[3])
+            data = log["data"]
+            if isinstance(data, str):
+                data = bytes.fromhex(data[2:]) if data.startswith("0x") else bytes.fromhex(data)
+            # Mint data: sender(32) + amount(32) + amount0(32) + amount1(32)
+            amount = int.from_bytes(data[32:64], "big", signed=False)
+            amount0 = int.from_bytes(data[64:96], "big", signed=False)
+            amount1 = int.from_bytes(data[96:128], "big", signed=False)
+        elif topic0 == BURN_TOPIC:
+            action = LiquidityAction.BURN
+            if len(topics) < 4:
+                return None
+            tick_lower = self._decode_int24(topics[1])
+            tick_upper = self._decode_int24(topics[2])
+            data = log["data"]
+            if isinstance(data, str):
+                data = bytes.fromhex(data[2:]) if data.startswith("0x") else bytes.fromhex(data)
+            # Burn data: amount(32) + amount0(32) + amount1(32)
+            amount = int.from_bytes(data[0:32], "big", signed=False)
+            amount0 = int.from_bytes(data[32:64], "big", signed=False)
+            amount1 = int.from_bytes(data[64:96], "big", signed=False)
+        else:
+            return None
+
+        tx_hash = log["transactionHash"]
+        if isinstance(tx_hash, bytes):
+            tx_hash = tx_hash.hex()
+        if not tx_hash.startswith("0x"):
+            tx_hash = "0x" + tx_hash
+
+        current_tick = self._last_tick.get(pool_address, 0)
+
+        return LiquidityEvent(
+            pair_name=pair_name,
+            fee_tier=fee_tier,
+            block_number=log["blockNumber"],
+            block_timestamp=0,
+            transaction_hash=tx_hash,
+            pool_address=pool_address,
+            action=action,
+            tick_lower=tick_lower,
+            tick_upper=tick_upper,
+            amount=amount,
+            amount0=amount0,
+            amount1=amount1,
+            current_tick=current_tick,
+        )
+
+    @staticmethod
+    def _decode_int24(topic) -> int:
+        if isinstance(topic, bytes):
+            raw = topic
+        else:
+            s = topic if isinstance(topic, str) else str(topic)
+            if s.startswith("0x"):
+                s = s[2:]
+            raw = bytes.fromhex(s)
+        val = int.from_bytes(raw[-3:], "big", signed=False)
+        if val >= 0x800000:
+            val -= 0x1000000
+        return val
 
     async def _handle_reconnect(self) -> None:
         delay = self._config.infrastructure.reconnect_delay_seconds

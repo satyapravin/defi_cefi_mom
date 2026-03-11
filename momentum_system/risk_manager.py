@@ -8,7 +8,7 @@ from config import Config
 from database import Database
 from deribit_client import DeribitClient
 from logger import setup_logger
-from models import Direction, OrderRequest
+from models import Direction, OrderRequest, Regime
 
 logger = setup_logger()
 
@@ -29,6 +29,7 @@ class RiskManager:
         self._running = False
         self._portfolio_cache: dict[str, dict] = {}
         self._positions: dict[str, dict] = {}
+        self._regime_filter = None
 
     async def approve_order(
         self, request: OrderRequest
@@ -139,8 +140,18 @@ class RiskManager:
 
                     pnl_bps = direction * (mid - entry_price) / entry_price * 10000
 
+                    # Regime-aware stop widening: in CHAOTIC regime widen
+                    # the stop by 50% to avoid premature stop-outs.
+                    effective_stop_bps = risk.stop_loss_bps
+                    if self._regime_filter is not None:
+                        regime = self._regime_filter.get_regime(pair_name)
+                        if regime == Regime.CHAOTIC:
+                            effective_stop_bps = risk.stop_loss_bps * 1.5
+                        elif regime == Regime.QUIET:
+                            effective_stop_bps = risk.stop_loss_bps * 0.8
+
                     # Stop-loss
-                    if pnl_bps < -risk.stop_loss_bps:
+                    if pnl_bps < -effective_stop_bps:
                         logger.warning(
                             "Stop-loss triggered",
                             pair=pair_name,
@@ -208,6 +219,9 @@ class RiskManager:
             self._positions[pair_name] = position
         else:
             self._positions.pop(pair_name, None)
+
+    def set_regime_filter(self, regime_filter) -> None:
+        self._regime_filter = regime_filter
 
     async def _on_portfolio_update(self, data: dict) -> None:
         currency = data.get("currency", "")

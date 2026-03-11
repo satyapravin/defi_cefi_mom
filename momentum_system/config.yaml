@@ -1,0 +1,62 @@
+system:
+  log_level: "INFO"
+  heartbeat_interval_seconds: 60
+  database_path: "data/events.db"
+  mode: "live"
+
+infrastructure:
+  rpc_url: "wss://arb-mainnet.g.alchemy.com/v2/YOUR_KEY"
+  chain_id: 42161
+  block_confirmations: 1
+  reconnect_delay_seconds: 5
+  max_reconnect_attempts: 50
+
+deribit:
+  base_url: "https://www.deribit.com"
+  ws_url: "wss://www.deribit.com/ws/api/v2"
+  client_id: "${DERIBIT_CLIENT_ID}"
+  client_secret: "${DERIBIT_CLIENT_SECRET}"
+
+pairs:
+  - name: "ETH-USDC"
+    deribit_instrument: "ETH-PERPETUAL"
+    token0: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+    token1: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+    token0_decimals: 18
+    token1_decimals: 6
+    invert_price: false
+    pools:
+      bp30:
+        address: "0xc473e2aEE3441BF9240Be85eb122aBB059A3B57c"
+        fee: 3000
+      bp5:
+        address: "0xC6962004f452bE9203591991D15f6b388e09E8D0"
+        fee: 500
+      bp1:
+        address: "0xd9e2a1a61B6E61b275cEc3264654d417e52C1b95c"
+        fee: 100
+    signal:
+      conviction_halflife_seconds: 480      # 8 min half-life — conviction persists across swap clusters
+      trend_entry_threshold: 1.5
+      trend_exit_threshold: 0.5
+      intensity_smoothing: 0.85
+      momentum_window_events: 30            # ~30 events — several minutes of 5 bps flow
+      min_autocorrelation: 0.05
+      conviction_cap: 3.0
+    execution:
+      offset_base_bps: 2.0                  # 2 bps base offset — room for the market to come to you
+      offset_conviction_bps: 6.0            # widens to 8 bps at low conviction
+      stale_order_seconds: 45               # cancel unfilled orders after 45s
+      allow_reprice: false
+      max_reprice_bps: 3.0
+      post_only: true
+    risk:
+      max_position_usd: 50000
+      max_position_contracts: 100
+      stop_loss_bps: 35                     # 35 bps stop — tolerates short-term noise
+      take_profit_bps: 50                   # 50 bps TP — lets winners run
+      cooldown_seconds: 120                 # 2 min cooldown — avoids re-entering chop
+      daily_loss_limit_usd: 500
+      max_open_orders: 3
+      margin_usage_limit_pct: 50
+      max_holding_seconds: 1800             # force-exit after 30 minutes

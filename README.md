@@ -131,7 +131,6 @@ Uniswap V3 Pools (Arbitrum)          Signal Pipeline              Deribit (CEX)
 ## Installation
 
 ```bash
-cd momentum_system
 pip install -r requirements.txt
 ```
 
@@ -420,8 +419,8 @@ Three Uniswap V3 pool addresses per pair:
 | Key | Description |
 |-----|-------------|
 | `bp30` | 30 bps fee tier pool — primary signal source for cluster detection. |
-| `bp5` | 5 bps fee tier pool — cross-tier coherence check and regime vol input. |
-| `bp1` | 1 bps fee tier pool — price reference for backtest fills. |
+| `bp5` | 5 bps fee tier pool — cross-tier coherence, regime vol, and backtest fill reference. |
+| `bp1` | 1 bps fee tier pool — data collection only (not used by signal or regime logic). |
 
 ### `pairs[].bp30_signal`
 
@@ -568,6 +567,124 @@ The stop-loss threshold adapts to the current regime:
 | QUIET | 0.8× (tighter — less noise to tolerate) |
 | ACTIVE | 1.0× (default — 40 bps) |
 | CHAOTIC | 1.5× (wider — avoid premature stop-outs in high vol) |
+
+---
+
+## Backtest Results
+
+Backtest on ~24 hours of real ETH-USDC Arbitrum data (43,808 swap events across BP5 and BP30 pools).
+
+### Optimal Parameters (from sweep)
+
+A grid sweep over `direction_ratio` (0.55 -- 0.80), `min_cluster_swaps` (2, 3, 4), and `window_seconds` (60, 120, 180) revealed:
+
+| Parameter | Finding | Optimal |
+|-----------|---------|---------|
+| `direction_ratio` | **Insensitive** -- BP30 clusters have ~100% directional agreement naturally. Values 0.55 through 0.80 produce identical results. | 0.7 (default) |
+| `min_cluster_swaps` | **Key differentiator** -- 2-3 swaps = high quality signals; 4 = over-trading and negative PnL. | 3 |
+| `window_seconds` | **Insensitive** -- 60s, 120s, 180s all produce identical trade outcomes. | 120 (default) |
+
+Sweep summary (unique outcomes):
+
+| min_swaps | trades | win% | avg net | PnL | Sharpe |
+|-----------|--------|------|---------|-----|--------|
+| 2 | 10 | 60% | +7.2 bp | +$2,071 | 13.63 |
+| **3** | **10** | **60%** | **+6.9 bp** | **+$2,110** | **13.21** |
+| 4 | 28 | 57% | -0.4 bp | -$96 | -0.63 |
+
+### Performance (optimal: `min_cluster_swaps=3`, `direction_ratio=0.7`, `window=120s`)
+
+```
+=================================================================
+  BACKTEST RESULTS - ETH-USDC (~24h real data)
+  Enhanced: exp-decay + cross-tier coherence + ACF regime
+=================================================================
+
+  Signals emitted:     16
+  Signals filled:      10
+  Fill rate:           62.5%
+  Total trades:        10
+
+  Win rate:            60.0%
+  Avg gross return:    +11.93 bps
+  Avg net return:      +6.93 bps
+  Total PnL:           $+2,109.85
+  Max drawdown:        $867.94 (45.7 bps)
+  Sharpe ratio:        13.21
+  Avg holding time:    470s
+```
+
+> **Note on Sharpe:** Annualized using observed trade frequency (10 trades / 22h = ~3,979 trades/year).
+> With only 10 trades the confidence interval is very wide; treat this as directionally indicative, not a reliable point estimate.
+> The per-trade information ratio (mean/std) is 0.22, which is the more meaningful metric at this sample size.
+
+### Alpha Decay Curve
+
+Measures average signed price continuation in the BP5 pool following a BP30 directional cluster signal. Positive values confirm that BP30 clusters predict short-term direction.
+
+```
+  +  1 BP5 events:  +0.501 bps  +++++
+  +  2 BP5 events:  +0.895 bps  ++++++++
+  +  5 BP5 events:  +2.076 bps  ++++++++++++++++++++
+  + 10 BP5 events:  +3.692 bps  ++++++++++++++++++++++++++++++++++++
+  + 20 BP5 events:  +5.672 bps  ++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+  + 50 BP5 events:  +6.454 bps  ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+  +100 BP5 events:  +4.984 bps  +++++++++++++++++++++++++++++++++++++++++++++++++
+```
+
+Alpha peaks at +6.45 bps around 50 BP5 events (~5-8 minutes post-signal), then decays. This validates the `max_holding_seconds=600` setting.
+
+### Regime Distribution
+
+| Regime | Events | Percentage |
+|--------|--------|------------|
+| Quiet | 20,321 | 46.4% |
+| Active | 19,705 | 45.0% |
+| Chaotic | 3,782 | 8.6% |
+
+### Exit Breakdown
+
+| Exit Reason | Trades | Win Rate | Avg PnL | Avg Hold |
+|-------------|--------|----------|---------|----------|
+| Take profit | 4 | 100% | +$779.71 | 264s |
+| Max holding time | 5 | 40% | -$129.71 | 611s |
+| Stop loss | 1 | 0% | -$360.42 | 589s |
+
+### Direction Breakdown
+
+| Direction | Trades | Win Rate | Total PnL |
+|-----------|--------|----------|-----------|
+| LONG | 8 | 75% | +$2,801.32 |
+| SHORT | 2 | 0% | -$691.46 |
+
+### PnL Distribution
+
+| Metric | Value |
+|--------|-------|
+| Mean | +$210.99 |
+| Median | +$109.69 |
+| Std | $564.54 |
+| Min | -$402.04 |
+| Max | +$1,474.09 |
+| P25 | -$261.19 |
+| P75 | +$569.75 |
+
+### Equity Curve
+
+| Metric | Value |
+|--------|-------|
+| Start | +$672.91 |
+| Peak | +$2,470.28 |
+| Trough | -$54.37 |
+| End | +$2,109.85 |
+
+### Signal Strength at Entry
+
+| Metric | Value |
+|--------|-------|
+| Mean | 0.951 |
+| Min | 0.861 |
+| Max | 1.000 |
 
 ---
 

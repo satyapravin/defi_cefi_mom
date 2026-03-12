@@ -247,8 +247,11 @@ class BacktestEngine:
 
         alpha_decay = self._compute_alpha_decay(events)
 
+        actual_start = events[0].block_timestamp if events else start_timestamp
+        actual_end = events[-1].block_timestamp if events else end_timestamp
+
         result = self._compute_metrics(
-            pair_name, start_timestamp, end_timestamp,
+            pair_name, actual_start, actual_end,
             signal_count, filled_count, trades, alpha_decay,
         )
         result.regime_distribution = regime_counts
@@ -413,8 +416,9 @@ class BacktestEngine:
             arr = np.array(net_returns_bps)
             mean_ret = float(arr.mean())
             std_ret = float(arr.std(ddof=1))
-            if std_ret > 0 and avg_holding > 0:
-                trades_per_year = 365.25 * 24 * 3600 / avg_holding
+            backtest_span = end_ts - start_ts
+            if std_ret > 0 and backtest_span > 0:
+                trades_per_year = total_trades / (backtest_span / (365.25 * 24 * 3600))
                 sharpe = (mean_ret / std_ret) * math.sqrt(trades_per_year)
             else:
                 sharpe = 0.0

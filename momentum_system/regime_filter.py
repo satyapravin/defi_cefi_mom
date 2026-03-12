@@ -17,6 +17,10 @@ class _PairRegimeState:
     regime: Regime = Regime.QUIET
     realized_vol: float = 0.0
     intensity: float = 0.0
+    bp30_returns: deque = field(default_factory=lambda: deque())
+    bp30_timestamps: deque = field(default_factory=lambda: deque())
+    autocorrelation: float = 0.0
+    mean_duration: float = 0.0
 
 
 class RegimeFilter:
@@ -40,9 +44,18 @@ class RegimeFilter:
 
         state.event_timestamps.append(ts)
 
-        if event.log_return is not None and event.fee_tier == FeeTier.BP1:
+        if event.log_return is not None and event.fee_tier == FeeTier.BP5:
             state.log_returns.append(event.log_return)
             state.return_timestamps.append(ts)
+
+        if event.log_return is not None and event.fee_tier == FeeTier.BP30:
+            state.bp30_returns.append(event.log_return)
+            state.bp30_timestamps.append(ts)
+            while len(state.bp30_returns) > cfg.acf_window_events:
+                state.bp30_returns.popleft()
+                state.bp30_timestamps.popleft()
+            self._update_autocorrelation(pair)
+            self._update_duration(pair)
 
         vol_cutoff = ts - cfg.vol_window_seconds
         while state.return_timestamps and state.return_timestamps[0] < vol_cutoff:
@@ -78,6 +91,30 @@ class RegimeFilter:
         else:
             state.regime = Regime.ACTIVE
 
+    def _update_autocorrelation(self, pair: str) -> None:
+        state = self._states[pair]
+        returns = list(state.bp30_returns)
+        if len(returns) < 10:
+            state.autocorrelation = 0.0
+            return
+        mean = sum(returns) / len(returns)
+        centered = [r - mean for r in returns]
+        var = sum(c ** 2 for c in centered)
+        if var == 0:
+            state.autocorrelation = 0.0
+            return
+        cov = sum(centered[i] * centered[i + 1] for i in range(len(centered) - 1))
+        state.autocorrelation = cov / var
+
+    def _update_duration(self, pair: str) -> None:
+        state = self._states[pair]
+        ts_list = list(state.bp30_timestamps)
+        if len(ts_list) < 2:
+            state.mean_duration = 0.0
+            return
+        durations = [ts_list[i + 1] - ts_list[i] for i in range(len(ts_list) - 1)]
+        state.mean_duration = sum(durations) / len(durations)
+
     def get_regime(self, pair_name: str) -> Regime:
         state = self._states.get(pair_name)
         return state.regime if state else Regime.QUIET
@@ -100,3 +137,23 @@ class RegimeFilter:
             Regime.ACTIVE: cfg.active_multiplier,
             Regime.CHAOTIC: cfg.chaotic_multiplier,
         }[state.regime]
+
+    def get_autocorrelation(self, pair_name: str) -> float:
+        state = self._states.get(pair_name)
+        return state.autocorrelation if state else 0.0
+
+    def get_mean_duration(self, pair_name: str) -> float:
+        state = self._states.get(pair_name)
+        return state.mean_duration if state else 0.0
+
+    def get_acf_multiplier(self, pair_name: str) -> float:
+        state = self._states.get(pair_name)
+        if not state:
+            return 1.0
+        cfg = self._regime_configs[pair_name]
+        acf = state.autocorrelation
+        if acf > cfg.acf_trending_threshold:
+            return cfg.acf_trending_multiplier
+        elif acf < cfg.acf_mean_revert_threshold:
+            return cfg.acf_mean_revert_multiplier
+        return 1.0

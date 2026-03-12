@@ -17,9 +17,7 @@ from config import (
     PoolsConfig,
     RegimeConfig,
     RiskConfig,
-    SignalConfig,
     SystemConfig,
-    ToxicityConfig,
 )
 from models import FeeTier, Regime, SwapEvent
 from regime_filter import RegimeFilter
@@ -53,7 +51,7 @@ def _make_swap(
     timestamp: int,
     price: float = 3000.0,
     log_return: float | None = 0.001,
-    fee_tier: FeeTier = FeeTier.BP1,
+    fee_tier: FeeTier = FeeTier.BP5,
 ) -> SwapEvent:
     return SwapEvent(
         pair_name="TEST-PAIR",

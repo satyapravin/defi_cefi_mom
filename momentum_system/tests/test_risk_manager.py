@@ -20,7 +20,6 @@ from config import (
     PoolConfig,
     PoolsConfig,
     RiskConfig,
-    SignalConfig,
     SystemConfig,
 )
 from database import Database
@@ -47,7 +46,6 @@ def _make_config(risk_cfg: RiskConfig | None = None) -> Config:
                     bp5=PoolConfig(address="0xbp5", fee=500),
                     bp1=PoolConfig(address="0xbp1", fee=100),
                 ),
-                signal=SignalConfig(),
                 execution=ExecutionConfig(),
                 risk=risk_cfg or RiskConfig(cooldown_seconds=2),
             )

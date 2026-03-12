@@ -9,11 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from models import (
     FeeTier,
-    FlowBucket,
     LiquidityAction,
     LiquidityEvent,
     SwapEvent,
-    SignalState,
     OrderState,
     TradeRecord,
     Direction,
@@ -46,14 +44,15 @@ CREATE TABLE IF NOT EXISTS signal_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     pair_name TEXT NOT NULL,
     timestamp REAL NOT NULL,
-    conviction_30 REAL NOT NULL,
-    trend_state_30 INTEGER NOT NULL,
-    momentum_5 REAL NOT NULL,
-    autocorrelation_5 REAL NOT NULL,
-    momentum_flag_5 INTEGER NOT NULL,
-    combined_signal REAL NOT NULL,
+    direction INTEGER NOT NULL,
     transition TEXT NOT NULL,
-    intensity_30 REAL NOT NULL,
+    signal_strength REAL NOT NULL,
+    regime TEXT NOT NULL,
+    regime_multiplier REAL NOT NULL,
+    bp30_count INTEGER NOT NULL,
+    autocorrelation REAL NOT NULL DEFAULT 0,
+    cross_tier_coherence REAL NOT NULL DEFAULT 1,
+    weighted_signal REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL
 );
 
@@ -112,31 +111,6 @@ CREATE TABLE IF NOT EXISTS liquidity_events (
     UNIQUE(transaction_hash, pool_address, action, tick_lower, tick_upper)
 );
 
-CREATE TABLE IF NOT EXISTS flow_buckets (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    pair_name TEXT NOT NULL,
-    bucket_start REAL NOT NULL,
-    bucket_end REAL NOT NULL,
-    flow_30 REAL NOT NULL,
-    flow_5 REAL NOT NULL,
-    flow_1 REAL NOT NULL,
-    volume_30 REAL NOT NULL,
-    volume_5 REAL NOT NULL,
-    volume_1 REAL NOT NULL,
-    price_move_30 REAL NOT NULL,
-    price_move_5 REAL NOT NULL,
-    price_move_1 REAL NOT NULL,
-    event_count_30 INTEGER NOT NULL,
-    event_count_5 INTEGER NOT NULL,
-    event_count_1 INTEGER NOT NULL,
-    ofi_30 REAL NOT NULL DEFAULT 0,
-    ofi_5 REAL NOT NULL DEFAULT 0,
-    ofi_1 REAL NOT NULL DEFAULT 0,
-    cluster_ratio_30 REAL NOT NULL DEFAULT 0,
-    cross_excitation REAL NOT NULL DEFAULT 0,
-    created_at REAL NOT NULL
-);
-
 CREATE INDEX IF NOT EXISTS idx_swap_pair_tier
     ON swap_events(pair_name, fee_tier, block_timestamp);
 
@@ -149,8 +123,6 @@ CREATE INDEX IF NOT EXISTS idx_trade_pair
 CREATE INDEX IF NOT EXISTS idx_liq_pair_tier
     ON liquidity_events(pair_name, fee_tier, block_timestamp);
 
-CREATE INDEX IF NOT EXISTS idx_bucket_pair
-    ON flow_buckets(pair_name, bucket_end);
 """
 
 
@@ -201,34 +173,6 @@ class Database:
                     "price": event.price,
                     "log_return": event.log_return,
                     "direction": event.direction,
-                    "created_at": time.time(),
-                },
-            )
-
-    async def insert_signal_state(self, state: SignalState) -> None:
-        async with self._engine.begin() as conn:
-            await conn.execute(
-                text(
-                    """INSERT INTO signal_log
-                    (pair_name, timestamp, conviction_30, trend_state_30,
-                     momentum_5, autocorrelation_5, momentum_flag_5,
-                     combined_signal, transition, intensity_30, created_at)
-                    VALUES
-                    (:pair_name, :timestamp, :conviction_30, :trend_state_30,
-                     :momentum_5, :autocorrelation_5, :momentum_flag_5,
-                     :combined_signal, :transition, :intensity_30, :created_at)"""
-                ),
-                {
-                    "pair_name": state.pair_name,
-                    "timestamp": state.timestamp,
-                    "conviction_30": state.conviction_30,
-                    "trend_state_30": state.trend_state_30,
-                    "momentum_5": state.momentum_5,
-                    "autocorrelation_5": state.autocorrelation_5,
-                    "momentum_flag_5": int(state.momentum_flag_5),
-                    "combined_signal": state.combined_signal,
-                    "transition": state.transition.value,
-                    "intensity_30": state.intensity_30,
                     "created_at": time.time(),
                 },
             )
@@ -434,54 +378,6 @@ class Database:
                     "amount0": str(event.amount0),
                     "amount1": str(event.amount1),
                     "current_tick": event.current_tick,
-                    "created_at": time.time(),
-                },
-            )
-
-    async def insert_flow_bucket(self, bucket: FlowBucket) -> None:
-        async with self._engine.begin() as conn:
-            await conn.execute(
-                text(
-                    """INSERT INTO flow_buckets
-                    (pair_name, bucket_start, bucket_end,
-                     flow_30, flow_5, flow_1,
-                     volume_30, volume_5, volume_1,
-                     price_move_30, price_move_5, price_move_1,
-                     event_count_30, event_count_5, event_count_1,
-                     ofi_30, ofi_5, ofi_1,
-                     cluster_ratio_30, cross_excitation,
-                     created_at)
-                    VALUES
-                    (:pair_name, :bucket_start, :bucket_end,
-                     :flow_30, :flow_5, :flow_1,
-                     :volume_30, :volume_5, :volume_1,
-                     :price_move_30, :price_move_5, :price_move_1,
-                     :event_count_30, :event_count_5, :event_count_1,
-                     :ofi_30, :ofi_5, :ofi_1,
-                     :cluster_ratio_30, :cross_excitation,
-                     :created_at)"""
-                ),
-                {
-                    "pair_name": bucket.pair_name,
-                    "bucket_start": bucket.bucket_start,
-                    "bucket_end": bucket.bucket_end,
-                    "flow_30": bucket.flow_30,
-                    "flow_5": bucket.flow_5,
-                    "flow_1": bucket.flow_1,
-                    "volume_30": bucket.volume_30,
-                    "volume_5": bucket.volume_5,
-                    "volume_1": bucket.volume_1,
-                    "price_move_30": bucket.price_move_30,
-                    "price_move_5": bucket.price_move_5,
-                    "price_move_1": bucket.price_move_1,
-                    "event_count_30": bucket.event_count_30,
-                    "event_count_5": bucket.event_count_5,
-                    "event_count_1": bucket.event_count_1,
-                    "ofi_30": bucket.ofi_30,
-                    "ofi_5": bucket.ofi_5,
-                    "ofi_1": bucket.ofi_1,
-                    "cluster_ratio_30": bucket.cluster_ratio_30,
-                    "cross_excitation": bucket.cross_excitation,
                     "created_at": time.time(),
                 },
             )

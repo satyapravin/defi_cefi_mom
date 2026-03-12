@@ -33,19 +33,18 @@ pairs:
         address: "0xC6962004f452bE9203591991D15f6b388e09E8D0"
         fee: 500
       bp1:
-        address: "0xd9e2a1a61B6E61b275cEc3264654d417e52C1b95c"
+        address: "0x6f38e884725a116c9c7fbf208e79fe8828a2595f"
         fee: 100
-    signal:
-      conviction_halflife_seconds: 480      # 8 min half-life — conviction persists across swap clusters
-      trend_entry_threshold: 1.5
-      trend_exit_threshold: 0.5
-      intensity_smoothing: 0.85
-      momentum_window_events: 30            # ~30 events — several minutes of 5 bps flow
-      min_autocorrelation: 0.05
-      conviction_cap: 3.0
+    bp30_signal:
+      window_seconds: 120                   # 2 min lookback for 30bps swaps
+      min_cluster_swaps: 3                  # need at least 3 swaps in window
+      direction_ratio: 0.7                  # 70% weighted agreement = signal
+      decay_alpha: 0.01                     # exp decay rate (half-life ~69s)
+      bp5_coherence_window_seconds: 60      # BP5 cross-tier confirmation window
+      bp5_coherence_min_events: 5           # min BP5 events for coherence
     execution:
-      offset_base_bps: 2.0                  # 2 bps base offset — room for the market to come to you
-      offset_conviction_bps: 6.0            # widens to 8 bps at low conviction
+      offset_base_bps: 2.0                  # 2 bps base offset
+      offset_conviction_bps: 6.0            # widens at low conviction
       stale_order_seconds: 45               # cancel unfilled orders after 45s
       allow_reprice: false
       max_reprice_bps: 3.0
@@ -53,32 +52,23 @@ pairs:
     risk:
       max_position_usd: 50000
       max_position_contracts: 100
-      stop_loss_bps: 35                     # 35 bps stop — tolerates short-term noise
-      take_profit_bps: 50                   # 50 bps TP — lets winners run
-      cooldown_seconds: 120                 # 2 min cooldown — avoids re-entering chop
+      stop_loss_bps: 40                     # 40 bps stop — above noise floor
+      take_profit_bps: 40                   # 40 bps TP — symmetric R:R
+      cooldown_seconds: 120                 # 2 min cooldown after loss
       daily_loss_limit_usd: 500
       max_open_orders: 3
       margin_usage_limit_pct: 50
-      max_holding_seconds: 1800             # force-exit after 30 minutes
-    toxicity:
-      bucket_seconds: 30                    # aggregate flow into 30s windows
-      tier_weight_30: 6.0                   # 30bps swaps weighted 6x
-      tier_weight_5: 2.0                    # 5bps swaps weighted 2x
-      tier_weight_1: 1.0                    # 1bps swaps weighted 1x
-      fti_percentile_threshold: 0.80        # only trade top 20% of FTI values
-      coherence_isolated_boost: 2.0         # boost when only 30bps has flow
-      coherence_aligned_boost: 1.0          # all tiers agree
-      trailing_hours: 24                    # percentile lookback
-      exit_fti_percentile: 0.30             # exit when FTI drops below 30th pctl
-      cluster_halflife_seconds: 15.0         # exp decay for Hawkes-inspired intensity
-      cluster_window_seconds: 5.0           # two 30bps events within 5s = cluster
-      cross_excitation_window_seconds: 10.0  # 30bps→5bps within 10s = info cascade
-      ofi_concentration_cap: 5.0            # cap |OFI_30|/|OFI_1| ratio
+      max_holding_seconds: 600              # force-exit after 10 min (aligned with alpha peak)
     regime:
       vol_window_seconds: 300               # 5 min rolling vol
-      vol_quiet_threshold: 0.0005           # below = QUIET
-      vol_chaotic_threshold: 0.003          # above = CHAOTIC
+      vol_quiet_threshold: 0.00004          # below = QUIET (calibrated to real BP5 vol)
+      vol_chaotic_threshold: 0.00006        # above = CHAOTIC (calibrated to real BP5 vol)
       intensity_window_seconds: 60
       chaotic_multiplier: 0.3               # size multiplier in CHAOTIC
       active_multiplier: 1.5                # size multiplier in ACTIVE
       quiet_multiplier: 1.0                 # size multiplier in QUIET
+      acf_window_events: 50                 # BP30 events for autocorrelation
+      acf_trending_threshold: 0.15          # above = trending regime
+      acf_mean_revert_threshold: -0.15      # below = mean-reverting regime
+      acf_trending_multiplier: 1.3          # boost when momentum confirmed
+      acf_mean_revert_multiplier: 0.3       # suppress when mean-reverting

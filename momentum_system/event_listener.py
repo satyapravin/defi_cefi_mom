@@ -18,6 +18,9 @@ SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67
 MINT_TOPIC = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde"
 BURN_TOPIC = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c"
 
+RPC_CALL_TIMEOUT = 15
+HEALTH_CHECK_INTERVAL = 30
+
 
 class EventListener:
     def __init__(
@@ -60,7 +63,9 @@ class EventListener:
             try:
                 provider = WebSocketProvider(self._config.infrastructure.rpc_url)
                 self._w3 = AsyncWeb3(provider)
-                connected = await self._w3.is_connected()
+                connected = await asyncio.wait_for(
+                    self._w3.is_connected(), timeout=RPC_CALL_TIMEOUT,
+                )
                 if not connected:
                     raise ConnectionError("Failed to connect to RPC")
 
@@ -75,33 +80,67 @@ class EventListener:
                     AsyncWeb3.to_checksum_address(a) for a in pool_addresses
                 ]
 
-                swap_filter = await self._w3.eth.filter({
-                    "topics": [SWAP_TOPIC],
-                    "address": checksum_addrs,
-                })
+                swap_filter = await asyncio.wait_for(
+                    self._w3.eth.filter({
+                        "topics": [SWAP_TOPIC],
+                        "address": checksum_addrs,
+                    }),
+                    timeout=RPC_CALL_TIMEOUT,
+                )
 
                 mint_burn_filter = None
                 if self._on_liquidity is not None:
-                    mint_burn_filter = await self._w3.eth.filter({
-                        "topics": [[MINT_TOPIC, BURN_TOPIC]],
-                        "address": checksum_addrs,
-                    })
+                    mint_burn_filter = await asyncio.wait_for(
+                        self._w3.eth.filter({
+                            "topics": [[MINT_TOPIC, BURN_TOPIC]],
+                            "address": checksum_addrs,
+                        }),
+                        timeout=RPC_CALL_TIMEOUT,
+                    )
 
+                polls_since_health_check = 0
                 while self._running:
                     try:
-                        swap_logs = await swap_filter.get_new_entries()
+                        swap_logs = await asyncio.wait_for(
+                            swap_filter.get_new_entries(),
+                            timeout=RPC_CALL_TIMEOUT,
+                        )
                         for log_entry in swap_logs:
                             await self._process_swap_log(log_entry)
 
                         if mint_burn_filter is not None:
-                            liq_logs = await mint_burn_filter.get_new_entries()
+                            liq_logs = await asyncio.wait_for(
+                                mint_burn_filter.get_new_entries(),
+                                timeout=RPC_CALL_TIMEOUT,
+                            )
                             for log_entry in liq_logs:
                                 await self._process_liquidity_log(log_entry)
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "RPC poll timed out, triggering reconnect",
+                            timeout=RPC_CALL_TIMEOUT,
+                        )
+                        raise
                     except Exception as e:
                         if not self._running:
                             break
                         logger.warning("Error polling logs", error=str(e))
                         raise
+
+                    polls_since_health_check += 1
+                    if polls_since_health_check >= HEALTH_CHECK_INTERVAL:
+                        polls_since_health_check = 0
+                        try:
+                            alive = await asyncio.wait_for(
+                                self._w3.is_connected(),
+                                timeout=RPC_CALL_TIMEOUT,
+                            )
+                            if not alive:
+                                logger.warning("Health check failed: provider disconnected")
+                                raise ConnectionError("Provider health check failed")
+                        except asyncio.TimeoutError:
+                            logger.warning("Health check timed out")
+                            raise ConnectionError("Provider health check timed out")
 
                     await asyncio.sleep(1)
 
@@ -288,8 +327,8 @@ class EventListener:
             action = LiquidityAction.BURN
             if len(topics) < 4:
                 return None
-            tick_lower = self._decode_int24(topics[1])
-            tick_upper = self._decode_int24(topics[2])
+            tick_lower = self._decode_int24(topics[2])
+            tick_upper = self._decode_int24(topics[3])
             data = log["data"]
             if isinstance(data, str):
                 data = bytes.fromhex(data[2:]) if data.startswith("0x") else bytes.fromhex(data)

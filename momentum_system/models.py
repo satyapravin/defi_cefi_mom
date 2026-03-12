@@ -62,19 +62,6 @@ class SwapEvent(BaseModel):
     direction: Optional[int] = None
 
 
-class SignalState(BaseModel):
-    pair_name: str
-    timestamp: float
-    conviction_30: float
-    trend_state_30: int
-    momentum_5: float
-    autocorrelation_5: float
-    momentum_flag_5: bool
-    combined_signal: float
-    transition: SignalTransition
-    intensity_30: float
-
-
 class OrderRequest(BaseModel):
     pair_name: str
     instrument: str
@@ -143,37 +130,15 @@ class LiquidityEvent(BaseModel):
     current_tick: Optional[int] = None
 
 
-class FlowBucket(BaseModel):
-    pair_name: str
-    bucket_start: float
-    bucket_end: float
-    flow_30: float = 0.0
-    flow_5: float = 0.0
-    flow_1: float = 0.0
-    volume_30: float = 0.0
-    volume_5: float = 0.0
-    volume_1: float = 0.0
-    price_move_30: float = 0.0
-    price_move_5: float = 0.0
-    price_move_1: float = 0.0
-    event_count_30: int = 0
-    event_count_5: int = 0
-    event_count_1: int = 0
-    ofi_30: float = 0.0
-    ofi_5: float = 0.0
-    ofi_1: float = 0.0
-    cluster_ratio_30: float = 0.0
-    cross_excitation: float = 0.0
-
-
-class ToxicitySignal(BaseModel):
+class TradeSignal(BaseModel):
     pair_name: str
     timestamp: float
-    fti: float
-    fti_percentile: float
     direction: Direction
-    regime: Regime
-    lp_bias: float
-    coherence: float
     transition: SignalTransition
+    signal_strength: float
+    regime: Regime
     regime_multiplier: float
+    bp30_count: int
+    autocorrelation: float = 0.0
+    cross_tier_coherence: float = 1.0
+    weighted_signal: float = 0.0

@@ -55,34 +55,27 @@ class PoolsConfig(BaseModel):
     bp1: PoolConfig
 
 
-class SignalConfig(BaseModel):
-    conviction_halflife_seconds: float = 480
-    trend_entry_threshold: float = 1.5
-    trend_exit_threshold: float = 0.5
-    intensity_smoothing: float = 0.85
-    momentum_window_events: int = 30
-    min_autocorrelation: float = 0.05
-    conviction_cap: float = 3.0
+class BP30SignalConfig(BaseModel):
+    window_seconds: float = 120
+    min_cluster_swaps: int = 3
+    direction_ratio: float = 0.7
+    decay_alpha: float = 0.01
+    bp5_coherence_window_seconds: float = 60
+    bp5_coherence_min_events: int = 5
 
-    @field_validator(
-        "conviction_halflife_seconds",
-        "trend_entry_threshold",
-        "trend_exit_threshold",
-        "conviction_cap",
-    )
+    @field_validator("window_seconds")
     @classmethod
-    def must_be_positive(cls, v: float) -> float:
+    def window_positive(cls, v: float) -> float:
         if v <= 0:
-            raise ValueError("Value must be positive")
+            raise ValueError("window_seconds must be positive")
         return v
 
-    @model_validator(mode="after")
-    def exit_lt_entry(self) -> SignalConfig:
-        if self.trend_exit_threshold >= self.trend_entry_threshold:
-            raise ValueError(
-                "trend_exit_threshold must be less than trend_entry_threshold"
-            )
-        return self
+    @field_validator("direction_ratio")
+    @classmethod
+    def ratio_range(cls, v: float) -> float:
+        if not 0.5 < v <= 1.0:
+            raise ValueError("direction_ratio must be in (0.5, 1.0]")
+        return v
 
 
 class ExecutionConfig(BaseModel):
@@ -120,22 +113,6 @@ class RiskConfig(BaseModel):
         return v
 
 
-class ToxicityConfig(BaseModel):
-    bucket_seconds: float = 30
-    tier_weight_30: float = 6.0
-    tier_weight_5: float = 2.0
-    tier_weight_1: float = 1.0
-    fti_percentile_threshold: float = 0.80
-    coherence_isolated_boost: float = 2.0
-    coherence_aligned_boost: float = 1.0
-    trailing_hours: int = 24
-    exit_fti_percentile: float = 0.30
-    cluster_halflife_seconds: float = 15.0
-    cluster_window_seconds: float = 5.0
-    cross_excitation_window_seconds: float = 10.0
-    ofi_concentration_cap: float = 5.0
-
-
 class RegimeConfig(BaseModel):
     vol_window_seconds: float = 300
     vol_quiet_threshold: float = 0.0005
@@ -144,6 +121,11 @@ class RegimeConfig(BaseModel):
     chaotic_multiplier: float = 0.3
     active_multiplier: float = 1.5
     quiet_multiplier: float = 1.0
+    acf_window_events: int = 50
+    acf_trending_threshold: float = 0.15
+    acf_mean_revert_threshold: float = -0.15
+    acf_trending_multiplier: float = 1.3
+    acf_mean_revert_multiplier: float = 0.3
 
 
 class PairConfig(BaseModel):
@@ -155,10 +137,9 @@ class PairConfig(BaseModel):
     token1_decimals: int
     invert_price: bool = False
     pools: PoolsConfig
-    signal: SignalConfig = SignalConfig()
+    bp30_signal: BP30SignalConfig = BP30SignalConfig()
     execution: ExecutionConfig = ExecutionConfig()
     risk: RiskConfig = RiskConfig()
-    toxicity: ToxicityConfig = ToxicityConfig()
     regime: RegimeConfig = RegimeConfig()
 
 

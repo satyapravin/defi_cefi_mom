@@ -9,13 +9,11 @@ from database import Database
 from deribit_client import DeribitClient
 from event_listener import EventListener
 from execution_manager import ExecutionManager
-from flow_toxicity import FlowToxicityEngine
 from logger import setup_logger
-from lp_monitor import LPMonitor
 from models import LiquidityEvent, SwapEvent
 from regime_filter import RegimeFilter
 from risk_manager import RiskManager
-from signal_engine import SignalEngine
+from signal_30bps import BP30SignalEngine
 
 
 async def main() -> None:
@@ -34,23 +32,21 @@ async def main() -> None:
     exec_mgr = ExecutionManager(config, db, deribit, risk_mgr)
 
     regime_filter = RegimeFilter(config)
-    lp_monitor = LPMonitor(config)
 
     risk_mgr.set_regime_filter(regime_filter)
 
-    toxicity_engine = FlowToxicityEngine(
-        config, db, regime_filter, lp_monitor, exec_mgr.on_toxicity_signal
+    signal_engine = BP30SignalEngine(
+        config, regime_filter, exec_mgr.on_trade_signal
     )
 
-    exec_mgr.set_on_position_closed(toxicity_engine.notify_position_closed)
+    exec_mgr.set_on_position_closed(signal_engine.notify_position_closed)
 
     async def on_swap(event: SwapEvent) -> None:
         regime_filter.on_swap(event)
-        lp_monitor.update_current_tick(event.pair_name, event.tick)
-        await toxicity_engine.on_swap(event)
+        await signal_engine.on_swap(event)
 
     async def on_liquidity(event: LiquidityEvent) -> None:
-        lp_monitor.on_liquidity_event(event)
+        pass
 
     listener = EventListener(
         config, db, on_swap=on_swap, on_liquidity=on_liquidity
@@ -84,10 +80,10 @@ async def main() -> None:
     if config.system.mode == "backtest":
         from backtest import BacktestEngine
 
-        logger.info("Running in backtest mode (toxicity)")
+        logger.info("Running in backtest mode")
         bt = BacktestEngine(config, db, execution_lag_blocks=1)
         for pair_cfg in config.pairs:
-            result = await bt.run_toxicity(
+            result = await bt.run_backtest(
                 pair_name=pair_cfg.name,
                 start_timestamp=0,
                 end_timestamp=int(2e9),
@@ -99,8 +95,6 @@ async def main() -> None:
                 trades=result.total_trades,
                 pnl=round(result.total_pnl_usd, 2),
                 sharpe=round(result.sharpe_ratio, 2),
-                tox_entries=result.toxicity_entry_count,
-                tox_exits=result.toxicity_exit_count,
                 regime_dist=result.regime_distribution,
             )
         return
@@ -112,7 +106,7 @@ async def main() -> None:
             _heartbeat(
                 config.system.heartbeat_interval_seconds,
                 logger,
-                toxicity_engine,
+                config,
                 regime_filter,
                 exec_mgr,
                 risk_mgr,
@@ -135,11 +129,11 @@ async def main() -> None:
 
 
 async def _heartbeat(
-    interval, logger, toxicity_engine, regime_filter, exec_mgr, risk_mgr
+    interval, logger, config, regime_filter, exec_mgr, risk_mgr
 ) -> None:
     while True:
         await asyncio.sleep(interval)
-        for pair_cfg in toxicity_engine._config.pairs:
+        for pair_cfg in config.pairs:
             pair = pair_cfg.name
             regime = regime_filter.get_regime(pair)
             vol = regime_filter.get_realized_vol(pair)

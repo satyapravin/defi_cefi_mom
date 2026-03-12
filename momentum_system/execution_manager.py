@@ -17,9 +17,8 @@ from models import (
     OrderStatus,
     Position,
     Regime,
-    SignalState,
     SignalTransition,
-    ToxicitySignal,
+    TradeSignal,
     TradeRecord,
 )
 from risk_manager import RiskManager
@@ -56,27 +55,23 @@ class ExecutionManager:
         self._stale_tasks: dict[str, asyncio.Task] = {}
         self._on_position_closed: Optional[Callable[[str], None]] = None
 
-    async def on_toxicity_signal(self, signal: ToxicitySignal) -> None:
+    async def on_trade_signal(self, signal: TradeSignal) -> None:
         pair = signal.pair_name
         logger.info(
-            "Toxicity signal received",
+            "Trade signal received",
             pair=pair,
             transition=signal.transition.value,
-            fti=round(signal.fti, 4),
-            pctl=round(signal.fti_percentile, 2),
+            direction=signal.direction.name,
+            strength=round(signal.signal_strength, 2),
             regime=signal.regime.value,
+            bp30_count=signal.bp30_count,
         )
 
         if signal.transition == SignalTransition.ENTRY:
-            await self._handle_toxicity_entry(pair, signal)
-        elif signal.transition == SignalTransition.EXIT:
-            await self._handle_toxicity_exit(pair, signal)
-        elif signal.transition == SignalTransition.REVERSAL:
-            await self._handle_toxicity_exit(pair, signal)
-            await self._handle_toxicity_entry(pair, signal)
+            await self._handle_signal_entry(pair, signal)
 
-    async def _handle_toxicity_entry(
-        self, pair: str, signal: ToxicitySignal
+    async def _handle_signal_entry(
+        self, pair: str, signal: TradeSignal
     ) -> None:
         pair_cfg = self._config.get_pair(pair)
         instrument = pair_cfg.deribit_instrument
@@ -85,21 +80,21 @@ class ExecutionManager:
 
         mid = self._deribit.get_mid_price(instrument)
         if mid is None:
-            logger.warning("No mid price, skipping toxicity entry", pair=pair)
+            logger.warning("No mid price, skipping entry", pair=pair)
             return
 
         direction = signal.direction
         size = max(
             1,
             round(
-                signal.fti_percentile
+                signal.signal_strength
                 * signal.regime_multiplier
                 * risk.max_position_contracts
             ),
         )
 
         limit_price = self._compute_limit_price(
-            mid, direction, signal.fti_percentile, ex
+            mid, direction, signal.signal_strength, ex
         )
         limit_price = _round_to_tick(limit_price, instrument)
 
@@ -110,12 +105,12 @@ class ExecutionManager:
             size=float(size),
             limit_price=limit_price,
             post_only=ex.post_only,
-            label=f"tox_entry_{uuid.uuid4().hex[:8]}",
+            label=f"bp30_entry_{uuid.uuid4().hex[:8]}",
         )
 
         approved, reason = await self._risk.approve_order(request)
         if not approved:
-            logger.warning("Toxicity order rejected by risk", pair=pair, reason=reason)
+            logger.warning("Order rejected by risk", pair=pair, reason=reason)
             return
 
         if self._mode == "live":
@@ -123,13 +118,13 @@ class ExecutionManager:
         else:
             order_id = f"paper_{uuid.uuid4().hex[:8]}"
             logger.info(
-                "Paper: toxicity entry",
+                "Paper: bp30 entry",
                 order_id=order_id,
                 pair=pair,
                 direction=direction.name,
                 size=size,
                 price=limit_price,
-                fti_pctl=round(signal.fti_percentile, 2),
+                strength=round(signal.signal_strength, 2),
                 regime=signal.regime.value,
             )
 
@@ -145,68 +140,10 @@ class ExecutionManager:
         task = asyncio.create_task(self._stale_check(order_id, pair))
         self._stale_tasks[order_id] = task
 
-    async def _handle_toxicity_exit(
-        self, pair: str, signal: ToxicitySignal
-    ) -> None:
-        pair_cfg = self._config.get_pair(pair)
-        instrument = pair_cfg.deribit_instrument
-
-        await self._cancel_pair_orders(pair)
-
-        pos = self._positions.get(pair)
-        if pos and pos.size > 0:
-            close_dir = (
-                Direction.SHORT
-                if pos.direction == Direction.LONG
-                else Direction.LONG
-            )
-            mid = self._deribit.get_mid_price(instrument)
-
-            if self._mode == "live":
-                await self._deribit.place_market_order(
-                    instrument, close_dir, pos.size, reduce_only=True
-                )
-            else:
-                logger.info(
-                    "Paper: toxicity exit",
-                    pair=pair,
-                    direction=close_dir.name,
-                    size=pos.size,
-                )
-
-            exit_price = mid if mid else pos.entry_price
-            await self._record_trade(pos, exit_price, "toxicity_exit")
-            self._positions.pop(pair, None)
-            self._risk.update_position(pair, None)
-
-            if self._on_position_closed:
-                self._on_position_closed(pair)
-
     def set_on_position_closed(
         self, callback: Callable[[str], None]
     ) -> None:
         self._on_position_closed = callback
-
-    async def on_signal(self, state: SignalState) -> None:
-        pair = state.pair_name
-        logger.info(
-            "Signal received",
-            pair=pair,
-            transition=state.transition.value,
-            signal=round(state.combined_signal, 4),
-        )
-
-        handlers = {
-            SignalTransition.ENTRY: self._handle_entry,
-            SignalTransition.EXIT: self._handle_exit,
-            SignalTransition.REVERSAL: self._handle_reversal,
-            SignalTransition.SCALE: self._handle_scale,
-            SignalTransition.REDUCE: self._handle_reduce,
-        }
-
-        handler = handlers.get(state.transition)
-        if handler:
-            await handler(pair, state)
 
     async def on_forced_exit(self, pair_name: str, reason: str) -> None:
         logger.info("Forced exit", pair=pair_name, reason=reason)
@@ -244,224 +181,6 @@ class ExecutionManager:
             if self._on_position_closed:
                 self._on_position_closed(pair_name)
 
-    async def _handle_entry(self, pair: str, state: SignalState) -> None:
-        pair_cfg = self._config.get_pair(pair)
-        instrument = pair_cfg.deribit_instrument
-        ex = pair_cfg.execution
-        risk = pair_cfg.risk
-
-        mid = self._deribit.get_mid_price(instrument)
-        if mid is None:
-            logger.warning("No mid price available, skipping entry", pair=pair)
-            return
-
-        direction = Direction.LONG if state.combined_signal > 0 else Direction.SHORT
-        limit_price = self._compute_limit_price(
-            mid, direction, abs(state.combined_signal), ex
-        )
-        limit_price = _round_to_tick(limit_price, instrument)
-
-        size = max(1, round(abs(state.combined_signal) * risk.max_position_contracts))
-
-        request = OrderRequest(
-            pair_name=pair,
-            instrument=instrument,
-            direction=direction,
-            size=float(size),
-            limit_price=limit_price,
-            post_only=ex.post_only,
-            label=f"entry_{uuid.uuid4().hex[:8]}",
-        )
-
-        approved, reason = await self._risk.approve_order(request)
-        if not approved:
-            logger.warning("Order rejected by risk", pair=pair, reason=reason)
-            return
-
-        if self._mode == "live":
-            order_id = await self._deribit.place_order(request)
-        else:
-            order_id = f"paper_{uuid.uuid4().hex[:8]}"
-            logger.info(
-                "Paper: order placed",
-                order_id=order_id,
-                pair=pair,
-                direction=direction.name,
-                size=size,
-                price=limit_price,
-            )
-
-        order_state = OrderState(
-            order_id=order_id,
-            request=request,
-            status=OrderStatus.PLACED,
-            placed_at=time.time(),
-        )
-        self._open_orders[order_id] = order_state
-        await self._database.insert_order(order_state)
-
-        task = asyncio.create_task(self._stale_check(order_id, pair))
-        self._stale_tasks[order_id] = task
-
-    async def _handle_exit(self, pair: str, state: SignalState) -> None:
-        pair_cfg = self._config.get_pair(pair)
-        instrument = pair_cfg.deribit_instrument
-
-        await self._cancel_pair_orders(pair)
-
-        pos = self._positions.get(pair)
-        if pos and pos.size > 0:
-            close_dir = (
-                Direction.SHORT
-                if pos.direction == Direction.LONG
-                else Direction.LONG
-            )
-            mid = self._deribit.get_mid_price(instrument)
-
-            if self._mode == "live":
-                await self._deribit.place_market_order(
-                    instrument, close_dir, pos.size, reduce_only=True
-                )
-            else:
-                logger.info(
-                    "Paper: market close",
-                    pair=pair,
-                    direction=close_dir.name,
-                    size=pos.size,
-                )
-
-            exit_price = mid if mid else pos.entry_price
-            await self._record_trade(pos, exit_price, "signal_exit")
-            self._positions.pop(pair, None)
-            self._risk.update_position(pair, None)
-
-    async def _handle_reversal(self, pair: str, state: SignalState) -> None:
-        exit_state = SignalState(
-            pair_name=state.pair_name,
-            timestamp=state.timestamp,
-            conviction_30=state.conviction_30,
-            trend_state_30=state.trend_state_30,
-            momentum_5=state.momentum_5,
-            autocorrelation_5=state.autocorrelation_5,
-            momentum_flag_5=state.momentum_flag_5,
-            combined_signal=0.0,
-            transition=SignalTransition.EXIT,
-            intensity_30=state.intensity_30,
-        )
-        await self._handle_exit(pair, exit_state)
-        await self._handle_entry(pair, state)
-
-    async def _handle_scale(self, pair: str, state: SignalState) -> None:
-        pair_cfg = self._config.get_pair(pair)
-        risk = pair_cfg.risk
-        instrument = pair_cfg.deribit_instrument
-        ex = pair_cfg.execution
-
-        target_size = max(
-            1, round(abs(state.combined_signal) * risk.max_position_contracts)
-        )
-        pos = self._positions.get(pair)
-        current_size = pos.size if pos else 0
-
-        if target_size <= current_size:
-            return
-
-        diff = target_size - current_size
-        mid = self._deribit.get_mid_price(instrument)
-        if mid is None:
-            return
-
-        direction = Direction.LONG if state.combined_signal > 0 else Direction.SHORT
-        limit_price = self._compute_limit_price(
-            mid, direction, abs(state.combined_signal), ex
-        )
-        limit_price = _round_to_tick(limit_price, instrument)
-
-        request = OrderRequest(
-            pair_name=pair,
-            instrument=instrument,
-            direction=direction,
-            size=float(diff),
-            limit_price=limit_price,
-            post_only=ex.post_only,
-            label=f"scale_{uuid.uuid4().hex[:8]}",
-        )
-
-        approved, reason = await self._risk.approve_order(request)
-        if not approved:
-            logger.warning("Scale order rejected", pair=pair, reason=reason)
-            return
-
-        if self._mode == "live":
-            order_id = await self._deribit.place_order(request)
-        else:
-            order_id = f"paper_{uuid.uuid4().hex[:8]}"
-            logger.info("Paper: scale order", order_id=order_id, size=diff)
-
-        order_state = OrderState(
-            order_id=order_id,
-            request=request,
-            status=OrderStatus.PLACED,
-            placed_at=time.time(),
-        )
-        self._open_orders[order_id] = order_state
-        await self._database.insert_order(order_state)
-
-        task = asyncio.create_task(self._stale_check(order_id, pair))
-        self._stale_tasks[order_id] = task
-
-    async def _handle_reduce(self, pair: str, state: SignalState) -> None:
-        pair_cfg = self._config.get_pair(pair)
-        risk = pair_cfg.risk
-        instrument = pair_cfg.deribit_instrument
-        ex = pair_cfg.execution
-
-        target_size = max(
-            1, round(abs(state.combined_signal) * risk.max_position_contracts)
-        )
-        pos = self._positions.get(pair)
-        if not pos or pos.size <= target_size:
-            return
-
-        diff = pos.size - target_size
-        mid = self._deribit.get_mid_price(instrument)
-        if mid is None:
-            return
-
-        close_dir = (
-            Direction.SHORT if pos.direction == Direction.LONG else Direction.LONG
-        )
-        limit_price = self._compute_limit_price(
-            mid, close_dir, abs(state.combined_signal), ex
-        )
-        limit_price = _round_to_tick(limit_price, instrument)
-
-        request = OrderRequest(
-            pair_name=pair,
-            instrument=instrument,
-            direction=close_dir,
-            size=float(diff),
-            limit_price=limit_price,
-            post_only=ex.post_only,
-            reduce_only=True,
-            label=f"reduce_{uuid.uuid4().hex[:8]}",
-        )
-
-        if self._mode == "live":
-            order_id = await self._deribit.place_order(request)
-        else:
-            order_id = f"paper_{uuid.uuid4().hex[:8]}"
-            logger.info("Paper: reduce order", order_id=order_id, size=diff)
-
-        order_state = OrderState(
-            order_id=order_id,
-            request=request,
-            status=OrderStatus.PLACED,
-            placed_at=time.time(),
-        )
-        self._open_orders[order_id] = order_state
-        await self._database.insert_order(order_state)
-
     @staticmethod
     def _compute_limit_price(
         mid: float,
@@ -497,6 +216,9 @@ class ExecutionManager:
             )
             logger.info("Stale order cancelled", order_id=order_id, pair=pair_name)
             self._open_orders.pop(order_id, None)
+
+            if pair_name not in self._positions and self._on_position_closed:
+                self._on_position_closed(pair_name)
 
     async def _on_book_update(self, data: dict) -> None:
         pass

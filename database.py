@@ -14,6 +14,7 @@ from models import (
     SwapEvent,
     OrderState,
     TradeRecord,
+    TradeSignal,
     Direction,
     OrderStatus,
     SignalTransition,
@@ -142,6 +143,37 @@ class Database:
                 stmt = statement.strip()
                 if stmt:
                     await conn.execute(text(stmt))
+
+    async def insert_signal(self, signal: TradeSignal) -> None:
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text(
+                    """INSERT INTO signal_log
+                    (pair_name, timestamp, direction, transition,
+                     signal_strength, regime, regime_multiplier,
+                     bp30_count, autocorrelation, cross_tier_coherence,
+                     weighted_signal, created_at)
+                    VALUES
+                    (:pair_name, :timestamp, :direction, :transition,
+                     :signal_strength, :regime, :regime_multiplier,
+                     :bp30_count, :autocorrelation, :cross_tier_coherence,
+                     :weighted_signal, :created_at)"""
+                ),
+                {
+                    "pair_name": signal.pair_name,
+                    "timestamp": signal.timestamp,
+                    "direction": signal.direction.value,
+                    "transition": signal.transition.value,
+                    "signal_strength": signal.signal_strength,
+                    "regime": signal.regime.value,
+                    "regime_multiplier": signal.regime_multiplier,
+                    "bp30_count": signal.bp30_count,
+                    "autocorrelation": signal.autocorrelation,
+                    "cross_tier_coherence": signal.cross_tier_coherence,
+                    "weighted_signal": signal.weighted_signal,
+                    "created_at": time.time(),
+                },
+            )
 
     async def insert_swap_event(self, event: SwapEvent) -> None:
         async with self._engine.begin() as conn:

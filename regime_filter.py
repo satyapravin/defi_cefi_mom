@@ -84,12 +84,24 @@ class RegimeFilter:
         state.intensity = len(state.event_timestamps) / elapsed if elapsed > 0 else 0.0
 
         vol = state.realized_vol
-        if vol > cfg.vol_chaotic_threshold:
-            state.regime = Regime.CHAOTIC
-        elif vol < cfg.vol_quiet_threshold:
-            state.regime = Regime.QUIET
-        else:
-            state.regime = Regime.ACTIVE
+        hysteresis = cfg.regime_hysteresis_pct / 100.0
+        prev = state.regime
+
+        if prev == Regime.QUIET:
+            if vol > cfg.vol_chaotic_threshold * (1 + hysteresis):
+                state.regime = Regime.CHAOTIC
+            elif vol > cfg.vol_quiet_threshold * (1 + hysteresis):
+                state.regime = Regime.ACTIVE
+        elif prev == Regime.ACTIVE:
+            if vol > cfg.vol_chaotic_threshold * (1 + hysteresis):
+                state.regime = Regime.CHAOTIC
+            elif vol < cfg.vol_quiet_threshold * (1 - hysteresis):
+                state.regime = Regime.QUIET
+        elif prev == Regime.CHAOTIC:
+            if vol < cfg.vol_quiet_threshold * (1 - hysteresis):
+                state.regime = Regime.QUIET
+            elif vol < cfg.vol_chaotic_threshold * (1 - hysteresis):
+                state.regime = Regime.ACTIVE
 
     def _update_autocorrelation(self, pair: str) -> None:
         state = self._states[pair]

@@ -5,7 +5,7 @@ system:
   mode: "live"
 
 infrastructure:
-  rpc_url: "wss://arb-mainnet.g.alchemy.com/v2/YOUR_KEY"
+  rpc_url: "${ALCHEMY_KEY}"
   chain_id: 42161
   block_confirmations: 1
   reconnect_delay_seconds: 5
@@ -19,7 +19,7 @@ deribit:
 
 pairs:
   - name: "ETH-USDC"
-    deribit_instrument: "ETH-PERPETUAL"
+    deribit_instrument: "ETH_USDC-PERPETUAL"
     token0: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
     token1: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
     token0_decimals: 18
@@ -43,28 +43,38 @@ pairs:
       bp5_coherence_window_seconds: 60      # BP5 cross-tier confirmation window
       bp5_coherence_min_events: 5           # min BP5 events for coherence
     execution:
-      offset_base_bps: 2.0                  # 2 bps base offset
-      offset_conviction_bps: 6.0            # widens at low conviction
+      offset_base_bps: 2.0                  # 2 bps base offset (used in backtest only)
+      offset_conviction_bps: 6.0            # widens at low conviction (backtest only)
       stale_order_seconds: 45               # cancel unfilled orders after 45s
       allow_reprice: false
       max_reprice_bps: 3.0
       post_only: true
+      maker_fee_bps: 0.0                    # Deribit maker rebate/fee
+      taker_fee_bps: 5.0                    # Deribit taker fee
     risk:
       max_position_usd: 50000
       max_position_contracts: 100
-      stop_loss_bps: 40                     # 40 bps stop — above noise floor
-      take_profit_bps: 40                   # 40 bps TP — symmetric R:R
+      trade_size_eth: 0.01                  # 0.01 ETH per trade (~$20 notional)
+      stop_loss_bps: 30                     # 30 bps stop — tight cut
+      take_profit_bps: 80                   # 80 bps TP — let winners run (asymmetric R:R for taker exit)
       cooldown_seconds: 120                 # 2 min cooldown after loss
       daily_loss_limit_usd: 500
       max_open_orders: 3
       margin_usage_limit_pct: 50
       max_holding_seconds: 600              # force-exit after 10 min (aligned with alpha peak)
+      trail_activate_bps: 10               # activate trailing stop after +10bp
+      trail_distance_bps: 15               # trail 15bp behind peak
+      breakeven_activate_bps: 999          # disabled (breakeven too aggressive for this alpha)
+      tp_decay_phase2_seconds: 180         # 3 min: phase 2
+      tp_decay_phase3_seconds: 360         # 6 min: phase 3
+      tp_decay_phase2_ratio: 1.0           # no TP decay (static TP outperforms)
+      tp_decay_phase3_ratio: 1.0           # no TP decay
     regime:
       vol_window_seconds: 300               # 5 min rolling vol
       vol_quiet_threshold: 0.00004          # below = QUIET (calibrated to real BP5 vol)
       vol_chaotic_threshold: 0.00006        # above = CHAOTIC (calibrated to real BP5 vol)
       intensity_window_seconds: 60
-      chaotic_multiplier: 0.3               # size multiplier in CHAOTIC
+      chaotic_multiplier: 0.0               # disabled — no trading in CHAOTIC
       active_multiplier: 1.5                # size multiplier in ACTIVE
       quiet_multiplier: 1.0                 # size multiplier in QUIET
       acf_window_events: 50                 # BP30 events for autocorrelation

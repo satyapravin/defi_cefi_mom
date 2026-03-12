@@ -49,7 +49,10 @@ class BacktestResult(BaseModel):
 
 
 class _SimulatedPosition:
-    __slots__ = ("direction", "size", "entry_price", "entry_time", "signal_at_entry")
+    __slots__ = (
+        "direction", "size", "entry_price", "entry_time",
+        "signal_at_entry", "peak_pnl_bps",
+    )
 
     def __init__(
         self,
@@ -64,6 +67,7 @@ class _SimulatedPosition:
         self.entry_price = entry_price
         self.entry_time = entry_time
         self.signal_at_entry = signal_at_entry
+        self.peak_pnl_bps = 0.0
 
 
 class BacktestEngine:
@@ -72,10 +76,18 @@ class BacktestEngine:
         config: Config,
         database: Database,
         execution_lag_blocks: int = 1,
+        min_signal_strength: float = 0.0,
+        entry_mode: str = "maker",
+        entry_fee_bps: float = 0.0,
+        exit_fee_bps: float = 5.0,
     ):
         self._config = config
         self._database = database
         self._execution_lag_blocks = execution_lag_blocks
+        self._min_signal_strength = min_signal_strength
+        self._entry_mode = entry_mode
+        self._entry_fee_rate = entry_fee_bps / 10000
+        self._exit_fee_rate = exit_fee_bps / 10000
 
     async def run_backtest(
         self,
@@ -135,7 +147,8 @@ class BacktestEngine:
         regime_counts: dict[str, int] = {"quiet": 0, "active": 0, "chaotic": 0}
 
         def _try_close_at_price(price: float, ts: float) -> None:
-            """O(1) SL/TP/max-hold check against a single price tick."""
+            """O(1) SL/TP/max-hold check with trailing stop, time-decay TP,
+            breakeven stop, and regime-aware SL."""
             nonlocal position, last_loss_time
 
             if position is None:
@@ -147,13 +160,42 @@ class BacktestEngine:
                 / position.entry_price
                 * 10000
             )
+            position.peak_pnl_bps = max(position.peak_pnl_bps, pnl_bps)
+            hold_secs = ts - position.entry_time
+
+            regime = regime_filter.get_regime(pair_name)
+            if regime == Regime.CHAOTIC:
+                effective_sl = risk.stop_loss_bps * 1.5
+            elif regime == Regime.QUIET:
+                effective_sl = risk.stop_loss_bps * 0.8
+            else:
+                effective_sl = risk.stop_loss_bps
+
+            if position.peak_pnl_bps >= risk.breakeven_activate_bps:
+                effective_sl = min(effective_sl, 0.0)
 
             reason = None
-            if pnl_bps <= -risk.stop_loss_bps:
+
+            if (risk.trail_activate_bps > 0
+                    and position.peak_pnl_bps >= risk.trail_activate_bps):
+                trail_stop = position.peak_pnl_bps - risk.trail_distance_bps
+                if pnl_bps <= trail_stop:
+                    reason = "trailing_stop"
+
+            if reason is None and pnl_bps <= -effective_sl:
                 reason = "stop_loss"
-            elif pnl_bps >= risk.take_profit_bps:
-                reason = "take_profit"
-            elif max_hold > 0 and ts - position.entry_time >= max_hold:
+
+            if reason is None:
+                if hold_secs < risk.tp_decay_phase2_seconds:
+                    effective_tp = risk.take_profit_bps
+                elif hold_secs < risk.tp_decay_phase3_seconds:
+                    effective_tp = risk.take_profit_bps * risk.tp_decay_phase2_ratio
+                else:
+                    effective_tp = risk.take_profit_bps * risk.tp_decay_phase3_ratio
+                if pnl_bps >= effective_tp:
+                    reason = "take_profit"
+
+            if reason is None and max_hold > 0 and hold_secs >= max_hold:
                 reason = "max_holding_time"
 
             if reason is None:
@@ -189,6 +231,14 @@ class BacktestEngine:
             if price is None:
                 return
 
+            if sig.signal_strength < self._min_signal_strength:
+                signal_engine.notify_position_closed(pair_name)
+                return
+
+            if sig.regime_multiplier <= 0:
+                signal_engine.notify_position_closed(pair_name)
+                return
+
             direction = sig.direction
             size = max(
                 1,
@@ -198,26 +248,29 @@ class BacktestEngine:
                     * risk.max_position_contracts
                 ),
             )
-            limit_price = self._compute_limit_price(
-                price, direction, sig.signal_strength, ex
-            )
 
-            fill_price, fill_time = self._scan_for_fill(
-                direction, limit_price, sig.timestamp,
-                ex.stale_order_seconds, ref_events,
-            )
-
-            if fill_price is not None:
-                position = _SimulatedPosition(
-                    direction=direction,
-                    size=float(size),
-                    entry_price=fill_price,
-                    entry_time=fill_time,
-                    signal_at_entry=sig.signal_strength,
+            if self._entry_mode == "maker":
+                limit_price = self._compute_limit_price(
+                    price, direction, sig.signal_strength, ex
                 )
-                filled_count += 1
+                fill_price, fill_time = self._scan_for_fill(
+                    direction, limit_price, sig.timestamp,
+                    ex.stale_order_seconds, ref_events,
+                )
+                if fill_price is None:
+                    signal_engine.notify_position_closed(pair_name)
+                    return
             else:
-                signal_engine.notify_position_closed(pair_name)
+                fill_price, fill_time = price, sig.timestamp
+
+            position = _SimulatedPosition(
+                direction=direction,
+                size=float(size),
+                entry_price=fill_price,
+                entry_time=fill_time,
+                signal_at_entry=sig.signal_strength,
+            )
+            filled_count += 1
 
         signal_engine = BP30SignalEngine(
             self._config,
@@ -273,7 +326,7 @@ class BacktestEngine:
         idx = bisect.bisect_right(sorted_ts, ts) - 1
         if idx >= 0:
             return ref_prices[sorted_ts[idx]]
-        return ref_prices[sorted_ts[0]]
+        return None
 
     @staticmethod
     def _scan_for_fill(
@@ -303,8 +356,8 @@ class BacktestEngine:
                 return limit_price, float(e.block_timestamp)
         return None, 0.0
 
-    @staticmethod
     def _close_position(
+        self,
         pos: _SimulatedPosition,
         exit_price: float,
         exit_time: float,
@@ -313,7 +366,8 @@ class BacktestEngine:
         instrument: str,
     ) -> TradeRecord:
         gross = pos.direction.value * (exit_price - pos.entry_price) * pos.size
-        fees = abs(pos.size * exit_price) * 0.0005
+        fees = (abs(pos.size * pos.entry_price) * self._entry_fee_rate
+                + abs(pos.size * exit_price) * self._exit_fee_rate)
         return TradeRecord(
             pair_name=pair_name,
             instrument=instrument,

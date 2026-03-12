@@ -169,7 +169,7 @@ async def test_stop_loss_triggers_exit(setup):
         except asyncio.CancelledError:
             pass
 
-    # 50 bps loss > 35 bps stop-loss -> should trigger
+    # 50 bps loss > 30 bps stop-loss -> should trigger
     assert len(exit_args) > 0
     assert exit_args[0][1] == "stop_loss"
 
@@ -188,7 +188,7 @@ async def test_take_profit_triggers(setup):
 
     risk_mgr.set_on_exit(on_exit)
 
-    deribit.get_mid_price.return_value = 3018.0
+    deribit.get_mid_price.return_value = 3025.0
     risk_mgr.update_position(
         "TEST-PAIR",
         {"size": 10, "direction": 1, "entry_price": 3000.0},
@@ -208,6 +208,6 @@ async def test_take_profit_triggers(setup):
         except asyncio.CancelledError:
             pass
 
-    # 60 bps profit > 50 bps TP -> should trigger
+    # 83 bps profit > 80 bps TP -> should trigger
     assert len(exit_args) > 0
     assert exit_args[0][1] == "take_profit"

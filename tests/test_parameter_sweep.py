@@ -88,11 +88,11 @@ class TestApplyParam:
     def test_modifies_risk_param(self):
         config = _make_config()
         spec = ParamSpec(
-            name="stop_loss_bps", section="risk", values=[20, 35, 50]
+            name="stop_loss_bps", section="risk", values=[20, 30, 50]
         )
         modified = _apply_param(config, "TEST-PAIR", spec, 50.0)
         assert modified.get_pair("TEST-PAIR").risk.stop_loss_bps == 50.0
-        assert config.get_pair("TEST-PAIR").risk.stop_loss_bps == 35.0
+        assert config.get_pair("TEST-PAIR").risk.stop_loss_bps == 30.0
 
     def test_modifies_regime_param(self):
         config = _make_config()
@@ -124,7 +124,7 @@ class TestGetDefaultValue:
         spec = ParamSpec(
             name="stop_loss_bps", section="risk", values=[]
         )
-        assert _get_default_value(config, "TEST-PAIR", spec) == 35.0
+        assert _get_default_value(config, "TEST-PAIR", spec) == 30.0
 
 
 class TestFindBest:

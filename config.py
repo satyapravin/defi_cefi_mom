@@ -36,6 +36,15 @@ class InfraConfig(BaseModel):
     reconnect_delay_seconds: int = 5
     max_reconnect_attempts: int = 50
 
+    @field_validator("rpc_url")
+    @classmethod
+    def ensure_wss(cls, v: str) -> str:
+        if v.startswith("https://"):
+            return "wss://" + v[len("https://"):]
+        if v.startswith("http://"):
+            return "ws://" + v[len("http://"):]
+        return v
+
 
 class DeribitConfig(BaseModel):
     base_url: str = "https://www.deribit.com"
@@ -62,6 +71,8 @@ class BP30SignalConfig(BaseModel):
     decay_alpha: float = 0.01
     bp5_coherence_window_seconds: float = 60
     bp5_coherence_min_events: int = 5
+    bp5_coherence_min_threshold: float = 0.0
+    long_only: bool = False
 
     @field_validator("window_seconds")
     @classmethod
@@ -85,18 +96,29 @@ class ExecutionConfig(BaseModel):
     allow_reprice: bool = False
     max_reprice_bps: float = 3.0
     post_only: bool = True
+    exit_fee_bps: float = 5.0
+    maker_fee_bps: float = 0.0
+    taker_fee_bps: float = 5.0
 
 
 class RiskConfig(BaseModel):
     max_position_usd: float = 50000
     max_position_contracts: float = 100
-    stop_loss_bps: float = 35
-    take_profit_bps: float = 50
+    trade_size_eth: float = 0.01
+    stop_loss_bps: float = 30
+    take_profit_bps: float = 80
     cooldown_seconds: float = 120
     daily_loss_limit_usd: float = 500
     max_open_orders: int = 3
     margin_usage_limit_pct: float = 50
-    max_holding_seconds: float = 1800
+    max_holding_seconds: float = 600
+    trail_activate_bps: float = 15.0
+    trail_distance_bps: float = 20.0
+    breakeven_activate_bps: float = 20.0
+    tp_decay_phase2_seconds: float = 180.0
+    tp_decay_phase3_seconds: float = 360.0
+    tp_decay_phase2_ratio: float = 0.6
+    tp_decay_phase3_ratio: float = 0.3
 
     @field_validator("stop_loss_bps")
     @classmethod
@@ -126,6 +148,7 @@ class RegimeConfig(BaseModel):
     acf_mean_revert_threshold: float = -0.15
     acf_trending_multiplier: float = 1.3
     acf_mean_revert_multiplier: float = 0.3
+    regime_hysteresis_pct: float = 10.0
 
 
 class PairConfig(BaseModel):

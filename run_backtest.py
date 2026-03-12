@@ -24,8 +24,10 @@ def make_config(
     min_cluster_swaps: int = 3,
     window_seconds: float = 120,
     decay_alpha: float = 0.01,
-    stop_loss_bps: float = 40,
-    take_profit_bps: float = 40,
+    stop_loss_bps: float = 30,
+    take_profit_bps: float = 80,
+    long_only: bool = False,
+    bp5_coherence_min_threshold: float = 0.0,
 ) -> Config:
     return Config(
         system=SystemConfig(mode="backtest", database_path="data/events.db"),
@@ -49,6 +51,8 @@ def make_config(
                 decay_alpha=decay_alpha,
                 bp5_coherence_window_seconds=60,
                 bp5_coherence_min_events=5,
+                bp5_coherence_min_threshold=bp5_coherence_min_threshold,
+                long_only=long_only,
             ),
             execution=ExecutionConfig(
                 offset_base_bps=2.0,
@@ -64,13 +68,20 @@ def make_config(
                 cooldown_seconds=120,
                 daily_loss_limit_usd=500,
                 max_holding_seconds=600,
+                trail_activate_bps=10,
+                trail_distance_bps=15,
+                breakeven_activate_bps=999,
+                tp_decay_phase2_seconds=180,
+                tp_decay_phase3_seconds=360,
+                tp_decay_phase2_ratio=1.0,
+                tp_decay_phase3_ratio=1.0,
             ),
             regime=RegimeConfig(
                 vol_window_seconds=300,
                 vol_quiet_threshold=0.00004,
                 vol_chaotic_threshold=0.00006,
                 intensity_window_seconds=60,
-                chaotic_multiplier=0.3,
+                chaotic_multiplier=0.0,
                 active_multiplier=1.5,
                 quiet_multiplier=1.0,
                 acf_window_events=50,
@@ -254,12 +265,43 @@ async def run_sweep():
     print()
 
 
+async def run_long_only_comparison():
+    """Compare long-only vs both-direction trading."""
+    db = Database("data/events.db")
+    await db.initialize()
+
+    print("=" * 65)
+    print("  LONG-ONLY vs BOTH-DIRECTION COMPARISON")
+    print("=" * 65)
+
+    for label, lo in [("Both directions", False), ("Long only", True)]:
+        config = make_config(long_only=lo)
+        engine = BacktestEngine(config, db, execution_lag_blocks=1)
+        r = await engine.run_backtest("ETH-USDC", 0, int(2e9))
+
+        longs = [t for t in r.trades if t.direction.value == 1]
+        shorts = [t for t in r.trades if t.direction.value == -1]
+        l_pnl = sum(t.net_pnl_usd for t in longs)
+        s_pnl = sum(t.net_pnl_usd for t in shorts)
+
+        print(f"\n  {label}:")
+        print(f"    Trades: {r.total_trades}  (L={len(longs)}, S={len(shorts)})")
+        print(f"    PnL:    ${r.total_pnl_usd:+,.2f}  (L=${l_pnl:+,.2f}, S=${s_pnl:+,.2f})")
+        print(f"    WR:     {r.win_rate:.0%}   Sharpe: {r.sharpe_ratio:.2f}")
+        print(f"    MaxDD:  ${r.max_drawdown_usd:.2f}")
+    print()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--sweep", action="store_true", help="Run parameter sweep")
+    parser.add_argument("--long-only-compare", action="store_true", help="Compare long-only vs both")
+    parser.add_argument("--long-only", action="store_true", help="Run backtest in long-only mode")
     args = parser.parse_args()
 
     if args.sweep:
         asyncio.run(run_sweep())
+    elif args.long_only_compare:
+        asyncio.run(run_long_only_comparison())
     else:
         asyncio.run(run())

@@ -463,6 +463,13 @@ Controls risk management.
 | `max_open_orders` | int | `3` | Maximum simultaneous unfilled orders per pair. |
 | `margin_usage_limit_pct` | float | `50` | Maximum margin usage as percentage of equity. |
 | `max_holding_seconds` | float | `600` | Hard cap on position hold time (10 min). Aligned with alpha peak from decay curve analysis. |
+| `trail_activate_bps` | float | `10` | Activate trailing stop after unrealized PnL exceeds this (bps). Set to 0 to disable. |
+| `trail_distance_bps` | float | `15` | Trailing stop distance behind peak PnL (bps). |
+| `breakeven_activate_bps` | float | `999` | Move stop to breakeven after PnL exceeds this. Set high to disable. |
+| `tp_decay_phase2_seconds` | float | `180` | Seconds before TP begins tightening (phase 2). |
+| `tp_decay_phase3_seconds` | float | `360` | Seconds before TP tightens further (phase 3). |
+| `tp_decay_phase2_ratio` | float | `1.0` | TP multiplier in phase 2 (1.0 = no decay). |
+| `tp_decay_phase3_ratio` | float | `1.0` | TP multiplier in phase 3 (1.0 = no decay). |
 
 ### `pairs[].regime`
 
@@ -565,8 +572,14 @@ The stop-loss threshold adapts to the current regime:
 | Regime | Stop-Loss Adjustment |
 |--------|---------------------|
 | QUIET | 0.8× (tighter — less noise to tolerate) |
-| ACTIVE | 1.0× (default — 40 bps) |
+| ACTIVE | 1.0× (default — 30 bps) |
 | CHAOTIC | 1.5× (wider — avoid premature stop-outs in high vol) |
+
+### Step 7: Trailing Stop
+
+Once unrealized PnL reaches `trail_activate_bps` (10bp), a trailing stop activates at `peak_pnl - trail_distance_bps` (15bp behind peak). This locks in profits on winning trades without cutting them short.
+
+Example: trade peaks at +40bp, trailing stop at +25bp. If price retraces to +25bp, the trailing stop exits with a +25bp gain instead of waiting for the 80bp TP or 600s max-hold timeout.
 
 ---
 
@@ -592,31 +605,33 @@ Sweep summary (unique outcomes):
 | **3** | **10** | **60%** | **+6.9 bp** | **+$2,110** | **13.21** |
 | 4 | 28 | 57% | -0.4 bp | -$96 | -0.63 |
 
+### Execution Model
+
+- **Entry:** Maker limit order on Deribit (0 bps fee), with conviction-based offset pricing
+- **Exit:** Taker market order (5 bps fee), triggered by trailing stop, SL, TP, or max-hold
+- **Round-trip fees:** 5 bps
+- **Trailing stop:** Activates at +10bp, trails 15bp behind peak PnL
+- **Regime-aware SL:** CHAOTIC widens 1.5x, QUIET tightens 0.8x
+
 ### Performance (optimal: `min_cluster_swaps=3`, `direction_ratio=0.7`, `window=120s`)
 
 ```
-=================================================================
-  BACKTEST RESULTS - ETH-USDC (~24h real data)
-  Enhanced: exp-decay + cross-tier coherence + ACF regime
-=================================================================
+  Signals emitted:     13
+  Signals filled:      9
+  Fill rate:           69.2%
+  Total trades:        9
 
-  Signals emitted:     16
-  Signals filled:      10
-  Fill rate:           62.5%
-  Total trades:        10
-
-  Win rate:            60.0%
-  Avg gross return:    +11.93 bps
-  Avg net return:      +6.93 bps
-  Total PnL:           $+2,109.85
-  Max drawdown:        $867.94 (45.7 bps)
-  Sharpe ratio:        13.21
-  Avg holding time:    470s
+  Win rate:            55.6%
+  Avg gross return:    +13.75 bps
+  Avg net return:      +8.74 bps
+  Total PnL:           $+3,329.04
+  Max drawdown:        $636.25 (33.5 bps)
+  Sharpe ratio:        14.56
+  Avg holding time:    436s
 ```
 
-> **Note on Sharpe:** Annualized using observed trade frequency (10 trades / 22h = ~3,979 trades/year).
-> With only 10 trades the confidence interval is very wide; treat this as directionally indicative, not a reliable point estimate.
-> The per-trade information ratio (mean/std) is 0.22, which is the more meaningful metric at this sample size.
+> **Note on Sharpe:** Annualized using observed trade frequency (9 trades / 22h = ~3,581 trades/year).
+> With only 9 trades the confidence interval is very wide; treat this as directionally indicative, not a reliable point estimate.
 
 ### Alpha Decay Curve
 
@@ -646,43 +661,43 @@ Alpha peaks at +6.45 bps around 50 BP5 events (~5-8 minutes post-signal), then d
 
 | Exit Reason | Trades | Win Rate | Avg PnL | Avg Hold |
 |-------------|--------|----------|---------|----------|
-| Take profit | 4 | 100% | +$779.71 | 264s |
-| Max holding time | 5 | 40% | -$129.71 | 611s |
-| Stop loss | 1 | 0% | -$360.42 | 589s |
+| Trailing stop | 4 | 75% | +$700.42 | 268s |
+| Max holding time | 3 | 67% | +$321.36 | 618s |
+| Stop loss | 2 | 0% | -$218.36 | 499s |
 
 ### Direction Breakdown
 
 | Direction | Trades | Win Rate | Total PnL |
 |-----------|--------|----------|-----------|
-| LONG | 8 | 75% | +$2,801.32 |
-| SHORT | 2 | 0% | -$691.46 |
+| LONG | 7 | 71% | +$3,811.03 |
+| SHORT | 2 | 0% | -$481.98 |
 
 ### PnL Distribution
 
 | Metric | Value |
 |--------|-------|
-| Mean | +$210.99 |
-| Median | +$109.69 |
-| Std | $564.54 |
-| Min | -$402.04 |
-| Max | +$1,474.09 |
-| P25 | -$261.19 |
-| P75 | +$569.75 |
+| Mean | +$369.89 |
+| Median | +$89.10 |
+| Std | $807.25 |
+| Min | -$289.43 |
+| Max | +$2,292.32 |
+| P25 | -$192.56 |
+| P75 | +$409.91 |
 
 ### Equity Curve
 
 | Metric | Value |
 |--------|-------|
-| Start | +$672.91 |
-| Peak | +$2,470.28 |
-| Trough | -$54.37 |
-| End | +$2,109.85 |
+| Start | +$1,164.42 |
+| Peak | +$3,611.49 |
+| Trough | +$617.27 |
+| End | +$3,329.04 |
 
 ### Signal Strength at Entry
 
 | Metric | Value |
 |--------|-------|
-| Mean | 0.951 |
+| Mean | 0.969 |
 | Min | 0.861 |
 | Max | 1.000 |
 

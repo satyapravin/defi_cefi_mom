@@ -29,6 +29,7 @@ class RiskManager:
         self._running = False
         self._portfolio_cache: dict[str, dict] = {}
         self._positions: dict[str, dict] = {}
+        self._peak_pnl_bps: dict[str, float] = {}
         self._regime_filter = None
 
     async def approve_order(
@@ -67,7 +68,8 @@ class RiskManager:
         # The execution manager passes open_order_count externally if needed.
 
         # (5) Margin check
-        currency = pair_cfg.deribit_instrument.split("-")[0]
+        inst = pair_cfg.deribit_instrument
+        currency = "USDC" if "_USDC" in inst else "USDT" if "_USDT" in inst else inst.split("-")[0]
         try:
             summary = await self._deribit.get_account_summary(currency)
             equity = summary.get("equity", 0)
@@ -114,82 +116,66 @@ class RiskManager:
                     size = abs(pos.get("size", 0))
                     entry_time = pos.get("entry_time", 0)
 
-                    # Max holding time
-                    if risk.max_holding_seconds > 0 and entry_time > 0:
-                        held_seconds = time.time() - entry_time
-                        if held_seconds >= risk.max_holding_seconds:
-                            logger.warning(
-                                "Max holding time exceeded",
-                                pair=pair_name,
-                                held_seconds=round(held_seconds, 1),
-                                limit=risk.max_holding_seconds,
-                            )
-                            close_dir = (
-                                Direction.SHORT if direction == 1 else Direction.LONG
-                            )
-                            try:
-                                await self._deribit.place_market_order(
-                                    instrument, close_dir, size, reduce_only=True
-                                )
-                            except Exception as e:
-                                logger.error("Max-hold exit failed", error=str(e))
-
-                            if self._on_exit:
-                                await self._on_exit(pair_name, "max_holding_time")
-                            continue
-
                     pnl_bps = direction * (mid - entry_price) / entry_price * 10000
+                    hold_secs = time.time() - entry_time if entry_time > 0 else 0
 
-                    # Regime-aware stop widening: in CHAOTIC regime widen
-                    # the stop by 50% to avoid premature stop-outs.
-                    effective_stop_bps = risk.stop_loss_bps
+                    peak = self._peak_pnl_bps.get(pair_name, 0.0)
+                    peak = max(peak, pnl_bps)
+                    self._peak_pnl_bps[pair_name] = peak
+
+                    effective_sl = risk.stop_loss_bps
                     if self._regime_filter is not None:
                         regime = self._regime_filter.get_regime(pair_name)
                         if regime == Regime.CHAOTIC:
-                            effective_stop_bps = risk.stop_loss_bps * 1.5
+                            effective_sl = risk.stop_loss_bps * 1.5
                         elif regime == Regime.QUIET:
-                            effective_stop_bps = risk.stop_loss_bps * 0.8
+                            effective_sl = risk.stop_loss_bps * 0.8
 
-                    # Stop-loss
-                    if pnl_bps < -effective_stop_bps:
-                        logger.warning(
-                            "Stop-loss triggered",
-                            pair=pair_name,
-                            pnl_bps=round(pnl_bps, 2),
-                        )
-                        close_dir = (
-                            Direction.SHORT if direction == 1 else Direction.LONG
-                        )
-                        try:
-                            await self._deribit.place_market_order(
-                                instrument, close_dir, size, reduce_only=True
-                            )
-                        except Exception as e:
-                            logger.error("Stop-loss order failed", error=str(e))
+                    if peak >= risk.breakeven_activate_bps:
+                        effective_sl = min(effective_sl, 0.0)
 
+                    reason: Optional[str] = None
+
+                    if (risk.trail_activate_bps > 0
+                            and peak >= risk.trail_activate_bps):
+                        trail_stop = peak - risk.trail_distance_bps
+                        if pnl_bps <= trail_stop:
+                            reason = "trailing_stop"
+
+                    if reason is None and pnl_bps <= -effective_sl:
+                        reason = "stop_loss"
+
+                    if reason is None:
+                        if hold_secs < risk.tp_decay_phase2_seconds:
+                            effective_tp = risk.take_profit_bps
+                        elif hold_secs < risk.tp_decay_phase3_seconds:
+                            effective_tp = risk.take_profit_bps * risk.tp_decay_phase2_ratio
+                        else:
+                            effective_tp = risk.take_profit_bps * risk.tp_decay_phase3_ratio
+                        if pnl_bps >= effective_tp:
+                            reason = "take_profit"
+
+                    if reason is None and risk.max_holding_seconds > 0 and hold_secs >= risk.max_holding_seconds:
+                        reason = "max_holding_time"
+
+                    if reason is None:
+                        continue
+
+                    logger.warning(
+                        "Risk exit triggered",
+                        pair=pair_name,
+                        reason=reason,
+                        pnl_bps=round(pnl_bps, 2),
+                        peak_pnl_bps=round(peak, 2),
+                        hold_secs=round(hold_secs, 1),
+                    )
+
+                    if reason == "stop_loss":
                         self.record_cooldown(pair_name)
-                        if self._on_exit:
-                            await self._on_exit(pair_name, "stop_loss")
+                    self._peak_pnl_bps.pop(pair_name, None)
 
-                    # Take-profit
-                    elif pnl_bps > risk.take_profit_bps:
-                        logger.info(
-                            "Take-profit triggered",
-                            pair=pair_name,
-                            pnl_bps=round(pnl_bps, 2),
-                        )
-                        close_dir = (
-                            Direction.SHORT if direction == 1 else Direction.LONG
-                        )
-                        try:
-                            await self._deribit.place_market_order(
-                                instrument, close_dir, size, reduce_only=True
-                            )
-                        except Exception as e:
-                            logger.error("Take-profit order failed", error=str(e))
-
-                        if self._on_exit:
-                            await self._on_exit(pair_name, "take_profit")
+                    if self._on_exit:
+                        await self._on_exit(pair_name, reason)
 
             except asyncio.CancelledError:
                 break
@@ -219,6 +205,7 @@ class RiskManager:
             self._positions[pair_name] = position
         else:
             self._positions.pop(pair_name, None)
+            self._peak_pnl_bps.pop(pair_name, None)
 
     def set_regime_filter(self, regime_filter) -> None:
         self._regime_filter = regime_filter

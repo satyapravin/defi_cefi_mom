@@ -57,7 +57,12 @@ async def main() -> None:
     if config.system.mode in ("live", "paper"):
         instruments = set(p.deribit_instrument for p in config.pairs)
         for inst in instruments:
-            currency = inst.split("-")[0]
+            if "_USDC" in inst:
+                currency = "USDC"
+            elif "_USDT" in inst:
+                currency = "USDT"
+            else:
+                currency = inst.split("-")[0]
             await deribit.subscribe_book(inst, exec_mgr._on_book_update)
             await deribit.subscribe_orders(inst, exec_mgr._on_order_update)
             await deribit.subscribe_trades(inst, exec_mgr._on_trade_update)

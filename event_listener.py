@@ -61,88 +61,88 @@ class EventListener:
 
         while self._running and reconnect_attempts <= max_attempts:
             try:
-                provider = WebSocketProvider(self._config.infrastructure.rpc_url)
-                self._w3 = AsyncWeb3(provider)
-                connected = await asyncio.wait_for(
-                    self._w3.is_connected(), timeout=RPC_CALL_TIMEOUT,
-                )
-                if not connected:
-                    raise ConnectionError("Failed to connect to RPC")
+                async with AsyncWeb3(WebSocketProvider(self._config.infrastructure.rpc_url)) as w3:
+                    self._w3 = w3
+                    connected = await asyncio.wait_for(
+                        w3.is_connected(), timeout=RPC_CALL_TIMEOUT,
+                    )
+                    if not connected:
+                        raise ConnectionError("Failed to connect to RPC")
 
-                logger.info(
-                    "Connected to RPC",
-                    chain_id=self._config.infrastructure.chain_id,
-                )
-                reconnect_attempts = 0
+                    logger.info(
+                        "Connected to RPC",
+                        chain_id=self._config.infrastructure.chain_id,
+                    )
+                    reconnect_attempts = 0
 
-                pool_addresses = list(self._pool_map.keys())
-                checksum_addrs = [
-                    AsyncWeb3.to_checksum_address(a) for a in pool_addresses
-                ]
+                    pool_addresses = list(self._pool_map.keys())
+                    checksum_addrs = [
+                        AsyncWeb3.to_checksum_address(a) for a in pool_addresses
+                    ]
 
-                swap_filter = await asyncio.wait_for(
-                    self._w3.eth.filter({
-                        "topics": [SWAP_TOPIC],
-                        "address": checksum_addrs,
-                    }),
-                    timeout=RPC_CALL_TIMEOUT,
-                )
-
-                mint_burn_filter = None
-                if self._on_liquidity is not None:
-                    mint_burn_filter = await asyncio.wait_for(
-                        self._w3.eth.filter({
-                            "topics": [[MINT_TOPIC, BURN_TOPIC]],
+                    swap_filter = await asyncio.wait_for(
+                        w3.eth.filter({
+                            "topics": [SWAP_TOPIC],
                             "address": checksum_addrs,
                         }),
                         timeout=RPC_CALL_TIMEOUT,
                     )
 
-                polls_since_health_check = 0
-                while self._running:
-                    try:
-                        swap_logs = await asyncio.wait_for(
-                            swap_filter.get_new_entries(),
+                    mint_burn_filter = None
+                    if self._on_liquidity is not None:
+                        mint_burn_filter = await asyncio.wait_for(
+                            w3.eth.filter({
+                                "topics": [[MINT_TOPIC, BURN_TOPIC]],
+                                "address": checksum_addrs,
+                            }),
                             timeout=RPC_CALL_TIMEOUT,
                         )
-                        for log_entry in swap_logs:
-                            await self._process_swap_log(log_entry)
 
-                        if mint_burn_filter is not None:
-                            liq_logs = await asyncio.wait_for(
-                                mint_burn_filter.get_new_entries(),
-                                timeout=RPC_CALL_TIMEOUT,
-                            )
-                            for log_entry in liq_logs:
-                                await self._process_liquidity_log(log_entry)
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "RPC poll timed out, triggering reconnect",
-                            timeout=RPC_CALL_TIMEOUT,
-                        )
-                        raise
-                    except Exception as e:
-                        if not self._running:
-                            break
-                        logger.warning("Error polling logs", error=str(e))
-                        raise
-
-                    polls_since_health_check += 1
-                    if polls_since_health_check >= HEALTH_CHECK_INTERVAL:
-                        polls_since_health_check = 0
+                    polls_since_health_check = 0
+                    while self._running:
                         try:
-                            alive = await asyncio.wait_for(
-                                self._w3.is_connected(),
+                            swap_logs = await asyncio.wait_for(
+                                swap_filter.get_new_entries(),
                                 timeout=RPC_CALL_TIMEOUT,
                             )
-                            if not alive:
-                                logger.warning("Health check failed: provider disconnected")
-                                raise ConnectionError("Provider health check failed")
-                        except asyncio.TimeoutError:
-                            logger.warning("Health check timed out")
-                            raise ConnectionError("Provider health check timed out")
+                            for log_entry in swap_logs:
+                                await self._process_swap_log(log_entry)
 
-                    await asyncio.sleep(1)
+                            if mint_burn_filter is not None:
+                                liq_logs = await asyncio.wait_for(
+                                    mint_burn_filter.get_new_entries(),
+                                    timeout=RPC_CALL_TIMEOUT,
+                                )
+                                for log_entry in liq_logs:
+                                    await self._process_liquidity_log(log_entry)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "RPC poll timed out, triggering reconnect",
+                                timeout=RPC_CALL_TIMEOUT,
+                            )
+                            raise
+                        except Exception as e:
+                            if not self._running:
+                                break
+                            logger.warning("Error polling logs", error=str(e))
+                            raise
+
+                        polls_since_health_check += 1
+                        if polls_since_health_check >= HEALTH_CHECK_INTERVAL:
+                            polls_since_health_check = 0
+                            try:
+                                alive = await asyncio.wait_for(
+                                    w3.is_connected(),
+                                    timeout=RPC_CALL_TIMEOUT,
+                                )
+                                if not alive:
+                                    logger.warning("Health check failed: provider disconnected")
+                                    raise ConnectionError("Provider health check failed")
+                            except asyncio.TimeoutError:
+                                logger.warning("Health check timed out")
+                                raise ConnectionError("Provider health check timed out")
+
+                        await asyncio.sleep(1)
 
             except Exception as e:
                 if not self._running:

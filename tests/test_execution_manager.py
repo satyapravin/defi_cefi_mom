@@ -133,11 +133,11 @@ async def test_stale_order_cancelled(setup):
 
 @pytest.mark.asyncio
 async def test_position_sizing(setup):
-    """T3: Size = strength * regime_mult * max_contracts."""
+    """T3: In paper/live mode, size = trade_size_eth from config."""
     config, db, deribit, risk_mgr, exec_mgr = setup
 
     sig = _make_signal(strength=0.8, direction=Direction.LONG)
     await exec_mgr.on_trade_signal(sig)
 
     order = list(exec_mgr._open_orders.values())[0]
-    assert order.request.size == 80  # 0.8 * 1.0 * 100
+    assert order.request.size == 0.01  # trade_size_eth default

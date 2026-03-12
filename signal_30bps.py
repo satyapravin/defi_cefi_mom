@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from typing import Callable, Awaitable, Optional
+from typing import Callable, Awaitable, Optional, TYPE_CHECKING
 
 from config import BP30SignalConfig, Config
 from models import (
@@ -23,6 +23,9 @@ from models import (
 )
 from regime_filter import RegimeFilter
 
+if TYPE_CHECKING:
+    from database import Database
+
 
 class BP30SignalEngine:
     """Directional cluster detector with exp-decay weighting and cross-tier confirmation."""
@@ -32,21 +35,25 @@ class BP30SignalEngine:
         config: Config,
         regime_filter: RegimeFilter,
         on_signal: Callable[[TradeSignal], Awaitable[None]],
+        database: Optional["Database"] = None,
     ):
         self._config = config
         self._regime_filter = regime_filter
         self._on_signal = on_signal
+        self._database = database
 
-        self._windows: dict[str, deque[tuple[float, int, float]]] = {}
-        self._bp5_windows: dict[str, deque[tuple[float, int]]] = {}
+        self._windows: dict[str, deque[tuple[float, int, float, float]]] = {}
+        self._bp5_windows: dict[str, deque[tuple[float, float, float]]] = {}
         self._has_position: dict[str, bool] = {}
         self._signal_cfgs: dict[str, BP30SignalConfig] = {}
+        self._token1_decimals: dict[str, int] = {}
 
         for pair_cfg in config.pairs:
             self._windows[pair_cfg.name] = deque()
             self._bp5_windows[pair_cfg.name] = deque()
             self._has_position[pair_cfg.name] = False
             self._signal_cfgs[pair_cfg.name] = pair_cfg.bp30_signal
+            self._token1_decimals[pair_cfg.name] = pair_cfg.token1_decimals
 
     async def on_swap(self, event: SwapEvent) -> None:
         pair = event.pair_name
@@ -67,8 +74,12 @@ class BP30SignalEngine:
         d = 1 if event.log_return > 0 else -1
         lr = event.log_return
 
+        decimals = self._token1_decimals.get(pair, 6)
+        amount_usd = abs(event.amount1) / (10 ** decimals)
+        amount_usd = max(amount_usd, 1.0)
+
         window = self._windows[pair]
-        window.append((ts, d, lr))
+        window.append((ts, d, lr, amount_usd))
 
         cutoff = ts - cfg.window_seconds
         while window and window[0][0] < cutoff:
@@ -83,8 +94,8 @@ class BP30SignalEngine:
         alpha = cfg.decay_alpha
         weighted_sum = 0.0
         weight_total = 0.0
-        for t_k, d_k, r_k in window:
-            w = math.exp(-alpha * (ts - t_k))
+        for t_k, d_k, r_k, usd_k in window:
+            w = usd_k * math.exp(-alpha * (ts - t_k))
             weighted_sum += r_k * w
             weight_total += abs(r_k) * w
 
@@ -98,7 +109,18 @@ class BP30SignalEngine:
 
         direction = Direction.LONG if weighted_sum > 0 else Direction.SHORT
 
+        if cfg.long_only and direction == Direction.SHORT:
+            return
+
         coherence = self._compute_bp5_coherence(pair, direction, cfg)
+
+        bp5_window = self._bp5_windows.get(pair)
+        bp5_has_data = bp5_window and len(bp5_window) >= cfg.bp5_coherence_min_events
+        if (cfg.bp5_coherence_min_threshold > 0
+                and bp5_has_data
+                and coherence < cfg.bp5_coherence_min_threshold):
+            return
+
         coherence_factor = 0.5 + 0.5 * coherence
         final_strength = raw_strength * coherence_factor
 
@@ -122,6 +144,12 @@ class BP30SignalEngine:
             weighted_signal=weighted_sum,
         )
 
+        if self._database is not None:
+            try:
+                await self._database.insert_signal(signal)
+            except Exception:
+                pass
+
         self._has_position[pair] = True
         await self._on_signal(signal)
 
@@ -133,8 +161,10 @@ class BP30SignalEngine:
         if bp5_window is None:
             return
         ts = float(event.block_timestamp)
-        d = 1 if event.log_return > 0 else -1
-        bp5_window.append((ts, d))
+        decimals = self._token1_decimals.get(pair, 6)
+        amount_usd = abs(event.amount1) / (10 ** decimals)
+        amount_usd = max(amount_usd, 1.0)
+        bp5_window.append((ts, event.log_return, amount_usd))
         cutoff = ts - cfg.bp5_coherence_window_seconds
         while bp5_window and bp5_window[0][0] < cutoff:
             bp5_window.popleft()
@@ -145,9 +175,25 @@ class BP30SignalEngine:
         bp5_window = self._bp5_windows.get(pair)
         if not bp5_window or len(bp5_window) < cfg.bp5_coherence_min_events:
             return 1.0
-        target_d = 1 if direction == Direction.LONG else -1
-        agree = sum(1 for _, d in bp5_window if d == target_d)
-        return agree / len(bp5_window)
+
+        now = bp5_window[-1][0]
+        alpha = cfg.decay_alpha
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for ts_k, lr_k, usd_k in bp5_window:
+            w = usd_k * math.exp(-alpha * (now - ts_k))
+            weighted_sum += lr_k * w
+            weight_total += abs(lr_k) * w
+
+        if weight_total == 0:
+            return 1.0
+
+        # Signed directional strength: -1 (fully short) to +1 (fully long)
+        signed_strength = weighted_sum / weight_total
+        if direction == Direction.LONG:
+            return (1.0 + signed_strength) / 2.0
+        else:
+            return (1.0 - signed_strength) / 2.0
 
     def notify_position_closed(self, pair_name: str) -> None:
         self._has_position[pair_name] = False

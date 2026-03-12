@@ -28,6 +28,13 @@ logger = setup_logger()
 TICK_SIZES = {
     "ETH-PERPETUAL": 0.5,
     "BTC-PERPETUAL": 0.5,
+    "ETH_USDC-PERPETUAL": 0.01,
+    "BTC_USDC-PERPETUAL": 0.01,
+}
+
+MIN_ORDER_SIZES = {
+    "ETH_USDC-PERPETUAL": 0.001,
+    "BTC_USDC-PERPETUAL": 0.0001,
 }
 
 
@@ -53,7 +60,9 @@ class ExecutionManager:
         self._open_orders: dict[str, OrderState] = {}
         self._positions: dict[str, Position] = {}
         self._stale_tasks: dict[str, asyncio.Task] = {}
+        self._tp_orders: dict[str, str] = {}
         self._on_position_closed: Optional[Callable[[str], None]] = None
+        self._exit_fee_rate: float = 0.0005
 
     async def on_trade_signal(self, signal: TradeSignal) -> None:
         pair = signal.pair_name
@@ -78,25 +87,39 @@ class ExecutionManager:
         ex = pair_cfg.execution
         risk = pair_cfg.risk
 
-        mid = self._deribit.get_mid_price(instrument)
-        if mid is None:
-            logger.warning("No mid price, skipping entry", pair=pair)
-            return
-
         direction = signal.direction
-        size = max(
-            1,
-            round(
-                signal.signal_strength
-                * signal.regime_multiplier
-                * risk.max_position_contracts
-            ),
-        )
 
-        limit_price = self._compute_limit_price(
-            mid, direction, signal.signal_strength, ex
-        )
-        limit_price = _round_to_tick(limit_price, instrument)
+        if self._mode in ("live", "paper"):
+            if direction == Direction.LONG:
+                limit_price = self._deribit.get_best_bid(instrument)
+            else:
+                limit_price = self._deribit.get_best_ask(instrument)
+
+            if limit_price is None:
+                logger.warning("No book data, skipping entry", pair=pair)
+                return
+
+            limit_price = _round_to_tick(limit_price, instrument)
+            size = risk.trade_size_eth
+            min_size = MIN_ORDER_SIZES.get(instrument, 0.001)
+            size = max(min_size, round(size / min_size) * min_size)
+        else:
+            mid = self._deribit.get_mid_price(instrument)
+            if mid is None:
+                logger.warning("No mid price, skipping entry", pair=pair)
+                return
+            limit_price = self._compute_limit_price(
+                mid, direction, signal.signal_strength, ex
+            )
+            limit_price = _round_to_tick(limit_price, instrument)
+            size = max(
+                1,
+                round(
+                    signal.signal_strength
+                    * signal.regime_multiplier
+                    * risk.max_position_contracts
+                ),
+            )
 
         request = OrderRequest(
             pair_name=pair,
@@ -140,6 +163,9 @@ class ExecutionManager:
         task = asyncio.create_task(self._stale_check(order_id, pair))
         self._stale_tasks[order_id] = task
 
+    def set_exit_fee_rate(self, fee_bps: float) -> None:
+        self._exit_fee_rate = fee_bps / 10000
+
     def set_on_position_closed(
         self, callback: Callable[[str], None]
     ) -> None:
@@ -150,6 +176,7 @@ class ExecutionManager:
         pair_cfg = self._config.get_pair(pair_name)
         instrument = pair_cfg.deribit_instrument
 
+        self._tp_orders.pop(pair_name, None)
         await self._cancel_pair_orders(pair_name)
 
         pos = self._positions.get(pair_name)
@@ -162,9 +189,12 @@ class ExecutionManager:
             mid = self._deribit.get_mid_price(instrument)
 
             if self._mode == "live":
-                await self._deribit.place_market_order(
-                    instrument, close_dir, pos.size, reduce_only=True
-                )
+                try:
+                    await self._deribit.place_market_order(
+                        instrument, close_dir, pos.size, reduce_only=True
+                    )
+                except Exception as e:
+                    logger.error("Forced exit market order failed", pair=pair_name, error=str(e))
             else:
                 logger.info(
                     "Paper: market close",
@@ -196,6 +226,60 @@ class ExecutionManager:
             return mid - offset
         else:
             return mid + offset
+
+    async def _place_tp_order(self, pair: str, pos: Position) -> None:
+        """Place a GTC reduce_only limit order at the TP price after entry fill."""
+        pair_cfg = self._config.get_pair(pair)
+        instrument = pair_cfg.deribit_instrument
+        risk = pair_cfg.risk
+
+        if pos.direction == Direction.LONG:
+            tp_price = pos.entry_price * (1 + risk.take_profit_bps / 10000)
+            close_dir = Direction.SHORT
+        else:
+            tp_price = pos.entry_price * (1 - risk.take_profit_bps / 10000)
+            close_dir = Direction.LONG
+
+        tp_price = _round_to_tick(tp_price, instrument)
+
+        request = OrderRequest(
+            pair_name=pair,
+            instrument=instrument,
+            direction=close_dir,
+            size=pos.size,
+            limit_price=tp_price,
+            post_only=True,
+            reduce_only=True,
+            label=f"bp30_tp_{uuid.uuid4().hex[:8]}",
+        )
+
+        if self._mode == "live":
+            try:
+                order_id = await self._deribit.place_order(request)
+            except Exception as e:
+                logger.error("TP order placement failed", pair=pair, error=str(e))
+                return
+        else:
+            order_id = f"paper_tp_{uuid.uuid4().hex[:8]}"
+            logger.info(
+                "Paper: TP order placed",
+                order_id=order_id,
+                pair=pair,
+                direction=close_dir.name,
+                size=pos.size,
+                tp_price=tp_price,
+                entry_price=pos.entry_price,
+            )
+
+        order_state = OrderState(
+            order_id=order_id,
+            request=request,
+            status=OrderStatus.PLACED,
+            placed_at=time.time(),
+        )
+        self._open_orders[order_id] = order_state
+        self._tp_orders[pair] = order_id
+        await self._database.insert_order(order_state)
 
     async def _stale_check(self, order_id: str, pair_name: str) -> None:
         pair_cfg = self._config.get_pair(pair_name)
@@ -248,12 +332,32 @@ class ExecutionManager:
                     fill_price=tracked.fill_price,
                 )
 
-                self._update_position_from_fill(tracked)
-                self._open_orders.pop(order_id, None)
+                pair = tracked.request.pair_name
+                is_tp_fill = self._tp_orders.get(pair) == order_id
 
-                stale = self._stale_tasks.pop(order_id, None)
-                if stale:
-                    stale.cancel()
+                if is_tp_fill:
+                    pos = self._positions.get(pair)
+                    if pos:
+                        exit_price = tracked.fill_price or tracked.request.limit_price
+                        await self._record_trade(pos, exit_price, "take_profit")
+                        self._positions.pop(pair, None)
+                        self._risk.update_position(pair, None)
+                        if self._on_position_closed:
+                            self._on_position_closed(pair)
+                    self._tp_orders.pop(pair, None)
+                    self._open_orders.pop(order_id, None)
+                else:
+                    self._update_position_from_fill(tracked)
+                    self._open_orders.pop(order_id, None)
+
+                    stale = self._stale_tasks.pop(order_id, None)
+                    if stale:
+                        stale.cancel()
+
+                    if not tracked.request.reduce_only:
+                        pos = self._positions.get(pair)
+                        if pos:
+                            await self._place_tp_order(pair, pos)
 
             elif status == "cancelled":
                 tracked.status = OrderStatus.CANCELLED
@@ -265,6 +369,10 @@ class ExecutionManager:
                 if reason != "stale":
                     logger.warning("Order cancelled externally", order_id=order_id, reason=reason)
                 self._open_orders.pop(order_id, None)
+
+                pair = tracked.request.pair_name
+                if self._tp_orders.get(pair) == order_id:
+                    self._tp_orders.pop(pair, None)
 
     async def _on_trade_update(self, data: dict) -> None:
         trades = data if isinstance(data, list) else [data]
@@ -326,9 +434,15 @@ class ExecutionManager:
     async def _record_trade(
         self, pos: Position, exit_price: float, reason: str
     ) -> None:
+        pair_cfg = self._config.get_pair(pos.pair_name)
+        ex = pair_cfg.execution
+        entry_fee_rate = ex.maker_fee_bps / 10000
+        exit_fee_rate = ex.maker_fee_bps / 10000 if reason == "take_profit" else ex.taker_fee_bps / 10000
+
         direction_val = pos.direction.value
         gross_pnl = direction_val * (exit_price - pos.entry_price) * pos.size
-        fees = abs(pos.size * exit_price) * 0.0005  # estimated taker fee
+        fees = (abs(pos.size * pos.entry_price) * entry_fee_rate
+                + abs(pos.size * exit_price) * exit_fee_rate)
         net_pnl = gross_pnl - fees
 
         trade = TradeRecord(
